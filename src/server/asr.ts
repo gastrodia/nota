@@ -76,7 +76,16 @@ function connectAsr(
       try {
         const value = JSON.parse(data.toString()) as Record<string, unknown>;
         if (typeof value.code === "string" && !value.type) {
-          console.error("nota_asr_provider_rejected", { code: value.code });
+          console.error("nota_asr_provider_rejected", {
+            code: value.code,
+            reason:
+              typeof value.message === "string" &&
+              /model.*(?:not exist|not found|not supported)/i.test(
+                value.message,
+              )
+                ? "model_not_available"
+                : "request_rejected",
+          });
           throw new Error("asr_provider_rejected");
         }
         if (value.type === "error") {

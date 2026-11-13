@@ -1,6 +1,6 @@
 # Nota
 
-[在线预览](https://nota-seven-red.vercel.app)
+[在线预览](https://nota.jiajiwei.top)
 
 一个移动端优先的 AI 语音便签应用。说一段话或输入文字，整理成摘要与待办；需要回顾时，通过 Agent 查询历史记录、查看原文来源。
 
@@ -41,6 +41,8 @@ cp .env.example .env.local
 | `APP_URL`               | 部署后的 HTTPS 地址，本地开发可留空  |
 
 模型名称与接口地址已在 [.env.example](.env.example) 中提供默认值，接口地域需与对应 Key 一致。语音 WebSocket 路径为 `/api-ws/v1/realtime`；若语音与文本使用不同工作空间，可单独设置 `DASHSCOPE_ASR_API_KEY`。Blob 也支持私有存储的 Vercel OIDC 鉴权。
+
+本地与 Vercel 环境变量独立维护；修改 Vercel 配置后需要重新部署。当前线上文本已通过联调，香港工作空间的实时语音模型仍返回不可用，验证范围见[验证记录](docs/verification.md)。
 
 ```bash
 pnpm db:migrate
