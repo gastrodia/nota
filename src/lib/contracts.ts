@@ -31,6 +31,14 @@ export const searchNotesSchema = z
       .optional(),
   })
   .strict();
+export const listTodosSchema = z
+  .object({
+    status: z.enum(["pending", "completed", "all"]).default("pending"),
+    query: z.string().trim().max(200).nullable().default(null),
+    limit: z.number().int().min(1).max(50).default(20),
+    offset: z.number().int().min(0).max(100000).default(0),
+  })
+  .strict();
 export const agentResultSchema = z
   .object({
     title: z.string().max(120),
@@ -42,8 +50,18 @@ export const agentResultSchema = z
 export type AgentResult = z.infer<typeof agentResultSchema> & {
   needs_clarification?: boolean;
   todos: Todo[];
+  queried_todos?: Todo[];
   sources: Evidence[];
 };
+export interface TodoListResult {
+  todos: Todo[];
+  total: number;
+  has_more: boolean;
+  status: z.infer<typeof listTodosSchema>["status"];
+  query: string | null;
+  offset: number;
+  limit: number;
+}
 export interface User {
   id: string;
   email: string;

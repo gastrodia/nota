@@ -670,6 +670,26 @@ export function NotaWorkspace() {
                     </div>
                   </div>
                 ))}
+                {job.result.queried_todos?.map((todo) => (
+                  <div className="message-task" key={`queried-${todo.id}`}>
+                    <span>{todo.completed ? "✓" : "○"}</span>
+                    <div>
+                      <strong>{todo.title}</strong>
+                      <small>
+                        {todo.completed ? "已完成" : "未完成"} · 截止：
+                        {date(todo.due_at)}
+                      </small>
+                      {todo.note_id && (
+                        <button
+                          className="source-link"
+                          onClick={() => void showSource(todo.note_id!)}
+                        >
+                          查看来源 ↗
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                ))}
                 {job.result.sources.map((source) => (
                   <button
                     key={source.id}

@@ -688,6 +688,79 @@ test("todo updates cannot cross accounts", async () => {
     true,
   );
 });
+
+test("todo query isolates accounts, filters status and literal keywords, and reports pagination", async () => {
+  const a = await user();
+  const b = await user();
+  await query(
+    `INSERT INTO todos(user_id,title,completed,due_at) VALUES
+     ($1,'报价 100%_\\ 版本',false,'2026-12-16T15:00:00+08:00'),
+     ($1,'普通报价',false,'2026-12-15T15:00:00+08:00'),
+     ($1,'已完成报价',true,NULL),($2,'其他账户报价',false,NULL)`,
+    [a.id, b.id],
+  );
+  const made = await createJob(
+    a.id,
+    input("帮我看看有哪些待办", { kind: "chat" }),
+  );
+  const job = (await claimJob(a.id, made.id))!;
+  const first = await executeTool(job, "list_todos", { limit: 1 });
+  assert.equal(first.ok, true);
+  assert.equal(first.todo_list!.total, 2);
+  assert.equal(first.todo_list!.has_more, true);
+  assert.equal(first.todo_list!.todos[0].title, "普通报价");
+  const second = await executeTool(job, "list_todos", { limit: 1, offset: 1 });
+  assert.equal(second.todo_list!.total, 2);
+  assert.equal(second.todo_list!.has_more, false);
+  assert.equal(second.todo_list!.todos[0].title, "报价 100%_\\ 版本");
+  const beyond = await executeTool(job, "list_todos", { offset: 10 });
+  assert.equal(beyond.todo_list!.total, 2);
+  assert.deepEqual(beyond.todo_list!.todos, []);
+  const completed = await executeTool(job, "list_todos", {
+    status: "completed",
+  });
+  assert.deepEqual(
+    completed.todo_list!.todos.map((todo) => todo.title),
+    ["已完成报价"],
+  );
+  const all = await executeTool(job, "list_todos", { status: "all" });
+  assert.equal(all.todo_list!.total, 3);
+  for (const keyword of ["%", "_", "\\"]) {
+    const literal = await executeTool(job, "list_todos", { query: keyword });
+    assert.equal(literal.todo_list!.total, 1);
+    assert.equal(literal.todo_list!.todos[0].id, second.todo_list!.todos[0].id);
+  }
+  const empty = await executeTool(job, "list_todos", { query: "不存在" });
+  assert.equal(empty.todo_list!.total, 0);
+  assert.deepEqual(empty.todo_list!.todos, []);
+  const replay = await executeTool(job, "list_todos", { limit: 1 });
+  assert.deepEqual(replay, first);
+  const effects = await query(
+    "SELECT has_effect FROM tool_runs WHERE job_id=$1",
+    [job.id],
+  );
+  assert.ok(effects.rows.every((row) => row.has_effect === false));
+});
+
+test("todo query rejects invalid or account-supplied parameters without poisoning its transaction", async () => {
+  const u = await user();
+  const made = await createJob(u.id, input("查询待办", { kind: "chat" }));
+  const job = (await claimJob(u.id, made.id))!;
+  for (const args of [
+    { status: "invalid" },
+    { limit: 0 },
+    { limit: 51 },
+    { offset: -1 },
+    { offset: 1.5 },
+    { query: 123 },
+    { user_id: randomUUID() },
+  ]) {
+    const result = await executeTool(job, "list_todos", args);
+    assert.equal(result.ok, false);
+    assert.equal(result.todo_list, undefined);
+  }
+  assert.equal((await executeTool(job, "list_todos", {})).ok, true);
+});
 test("sessions are revocable; password hash and cookie attributes are enforced", async () => {
   const u = await user();
   const data = (

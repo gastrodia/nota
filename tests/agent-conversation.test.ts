@@ -22,6 +22,7 @@ process.env.DATABASE_URL = database;
 process.env.DASHSCOPE_API_KEY = "nota_conversation_fixture";
 const authorizations: Record<string, unknown>[] = [];
 let failFinalOnce = false;
+let failTodoFinalOnce = false;
 const provider = createServer(async (request, response) => {
   let raw = "";
   for await (const chunk of request) raw += chunk;
@@ -87,20 +88,64 @@ const provider = createServer(async (request, response) => {
       response.end("{}");
       return;
     }
+    if (input.includes("查询待办后重试") && !failTodoFinalOnce) {
+      failTodoFinalOnce = true;
+      response.writeHead(503);
+      response.end("{}");
+      return;
+    }
     const todos = tools.flatMap((r: { todo?: unknown }) =>
       r.todo ? [r.todo] : [],
+    );
+    const queried: { title: string }[] = tools.flatMap(
+      (r: { todo_list?: { todos: { title: string }[] } }) =>
+        r.todo_list?.todos ?? [],
     );
     message = {
       role: "assistant",
       content: JSON.stringify({
         title: "报价单",
         summary: input,
-        answer: todos.length ? "已保存待办，不会推送通知。" : "已整理。",
+        answer: todos.length
+          ? "已保存待办，不会推送通知。"
+          : queried.length
+            ? `未完成待办：${queried.map((todo) => todo.title).join("、")}`
+            : "已整理。",
         source_note_ids: [],
       }),
     };
   } else if (tools.length || input.includes("取消")) {
     message = { role: "assistant", content: "已处理。" };
+  } else if (input.includes("有哪些待办") || input.includes("查询待办")) {
+    assert.ok(
+      body.tools.some(
+        (tool: { function: { name: string } }) =>
+          tool.function.name === "list_todos",
+      ),
+    );
+    message = {
+      role: "assistant",
+      content: null,
+      tool_calls: [
+        ...(input.includes("和历史")
+          ? [
+              {
+                id: "empty-history",
+                type: "function",
+                function: {
+                  name: "search_notes",
+                  arguments: JSON.stringify({ query: "不存在的历史记录" }),
+                },
+              },
+            ]
+          : []),
+        {
+          id: "list",
+          type: "function",
+          function: { name: "list_todos", arguments: "{}" },
+        },
+      ],
+    };
   } else if (input.includes("多调用检索")) {
     message = {
       role: "assistant",
@@ -379,5 +424,83 @@ test("parallel supplements resolving one pending action create one todo", async 
         .rows[0].count,
     ),
     1,
+  );
+});
+
+test("Agent lists existing pending todos without creating them and persists query cards", async () => {
+  const user = await owner();
+  const other = await owner();
+  await query(
+    "INSERT INTO todos(user_id,title,completed) VALUES($1,'发送报价单',false),($1,'已经完成的事项',true),($2,'其他账户的事项',false)",
+    [user.id, other.id],
+  );
+  const result = await turn(user.id, randomUUID(), "帮我看看有哪些待办");
+  assert.equal(result.status, "succeeded");
+  assert.match(result.result!.answer, /发送报价单/);
+  assert.doesNotMatch(result.result!.answer, /已保存|已创建|其他账户|已经完成/);
+  assert.deepEqual(result.result!.todos, []);
+  assert.deepEqual(
+    result.result!.queried_todos?.map((todo) => todo.title),
+    ["发送报价单"],
+  );
+  assert.deepEqual(result.result!.sources, []);
+  const events = result.events.filter((event) => event.type === "tool_result");
+  assert.deepEqual(
+    events.map((event) => event.payload.name),
+    ["list_todos"],
+  );
+  assert.equal(
+    Number(
+      (await query("SELECT count(*) FROM todos WHERE user_id=$1", [user.id]))
+        .rows[0].count,
+    ),
+    2,
+  );
+});
+
+test("empty todo queries give an explicit answer and read-only results survive retry", async () => {
+  const user = await owner();
+  const empty = await turn(user.id, randomUUID(), "帮我看看有哪些待办");
+  assert.equal(empty.result!.answer, "没有找到符合条件的待办。");
+  assert.deepEqual(empty.result!.queried_todos, []);
+  await query("INSERT INTO todos(user_id,title) VALUES($1,'发送报价单')", [
+    user.id,
+  ]);
+  const job = await createJob(user.id, {
+    kind: "chat",
+    input: "查询待办后重试",
+    conversation_id: randomUUID(),
+    idempotency_key: randomUUID(),
+  });
+  await assert.rejects(runJob(user.id, job.id));
+  await runJob(user.id, job.id);
+  const result = await getJob(user.id, job.id);
+  assert.equal(result.result!.queried_todos?.length, 1);
+  assert.deepEqual(result.result!.todos, []);
+  assert.equal(
+    result.events.filter((event) => event.type === "tool_result").length,
+    1,
+  );
+  assert.equal(
+    (await query("SELECT has_effect FROM tool_runs WHERE job_id=$1", [job.id]))
+      .rows[0].has_effect,
+    false,
+  );
+});
+
+test("empty note search does not overwrite a successful todo query in the same turn", async () => {
+  const user = await owner();
+  await query("INSERT INTO todos(user_id,title) VALUES($1,'发送报价单')", [
+    user.id,
+  ]);
+  const result = await turn(user.id, randomUUID(), "查询待办和历史记录");
+  assert.match(result.result!.answer, /发送报价单/);
+  assert.deepEqual(result.result!.sources, []);
+  assert.equal(result.result!.queried_todos?.length, 1);
+  assert.deepEqual(
+    result.events
+      .filter((event) => event.type === "tool_result")
+      .map((event) => event.payload.name),
+    ["search_notes", "list_todos"],
   );
 });
