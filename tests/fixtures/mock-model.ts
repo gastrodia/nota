@@ -20,7 +20,8 @@ export function createMockModel() {
     const failureKey = first + (body.response_format ? ":final" : ":tool");
     if (
       (first.includes("fail-before") && !body.response_format) ||
-      (first.includes("fail-after") && body.response_format)
+      (first.includes("fail-after") &&
+        body.response_format?.json_schema?.name === "nota_result")
     ) {
       if (!failOnce.has(failureKey)) {
         failOnce.add(failureKey);
@@ -30,7 +31,16 @@ export function createMockModel() {
       }
     }
     let message;
-    if (body.response_format) {
+    if (body.response_format?.json_schema?.name === "nota_todo_authorization") {
+      const input = JSON.parse(first);
+      message = {
+        role: "assistant",
+        content: JSON.stringify({
+          authorized: !input.user_input.includes("不要"),
+          reason: "Protocol fixture",
+        }),
+      };
+    } else if (body.response_format) {
       const todos = tools.flatMap((r: { todo?: unknown }) =>
         r.todo ? [r.todo] : [],
       );

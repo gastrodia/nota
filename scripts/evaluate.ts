@@ -135,6 +135,14 @@ async function main() {
         const checks = {
           succeeded: job.status === "succeeded",
           todo_count: result.todos.length === test.todos,
+          no_unsupported_reminder:
+            !/(?:届时|到时).{0,8}提醒|(?:我会|会自动).{0,8}(提醒|通知)/.test(
+              result.answer,
+            ),
+          summary_without_internal_ids:
+            !/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(
+              result.summary,
+            ),
           search: !test.search || names.includes("search_notes"),
           sources:
             test.sources === undefined ||

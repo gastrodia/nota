@@ -44,11 +44,26 @@ export function errorResponse(error: unknown) {
 }
 export function assertOrigin(request: Request) {
   const origin = request.headers.get("origin");
-  if (
-    origin &&
-    origin !== new URL(request.url).origin &&
-    origin !== process.env.APP_URL
-  )
+  if (!origin) return;
+  const url = new URL(request.url);
+  const allowed = new Set([url.origin]);
+  // Next may normalize the internal URL to localhost; validate the actual HTTP authority too.
+  const host = request.headers.get("host");
+  if (host) {
+    try {
+      allowed.add(new URL(`${url.protocol}//${host}`).origin);
+    } catch {
+      /* invalid authority is not trusted */
+    }
+  }
+  if (process.env.APP_URL) {
+    try {
+      allowed.add(new URL(process.env.APP_URL).origin);
+    } catch {
+      /* invalid configured origin is not trusted */
+    }
+  }
+  if (!allowed.has(origin))
     throw new AppError(403, "INVALID_ORIGIN", "请求来源不受支持。");
 }
 export function handler(

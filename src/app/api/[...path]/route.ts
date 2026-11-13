@@ -53,7 +53,9 @@ async function route(request: Request) {
         audio_storage: audioConfigured(),
         asr:
           process.env.NOTA_TEST_MODE !== "1" &&
-          Boolean(process.env.DASHSCOPE_API_KEY),
+          Boolean(
+            process.env.DASHSCOPE_ASR_API_KEY || process.env.DASHSCOPE_API_KEY,
+          ),
         websocket_environment:
           process.env.VERCEL === "1" || Boolean(process.env.VERCEL_ENV),
       },

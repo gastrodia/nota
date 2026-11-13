@@ -16,6 +16,7 @@ const privateStorage: AudioStorage = {
     try {
       return await put(path, file, {
         access: "private",
+        token: process.env.BLOB_READ_WRITE_TOKEN || undefined,
         addRandomSuffix: true,
         contentType,
         abortSignal: AbortSignal.timeout(30000),
@@ -32,6 +33,7 @@ const privateStorage: AudioStorage = {
     try {
       const result = await get(path, {
         access: "private",
+        token: process.env.BLOB_READ_WRITE_TOKEN || undefined,
         useCache: false,
         abortSignal: AbortSignal.timeout(30000),
       });
@@ -51,11 +53,18 @@ const privateStorage: AudioStorage = {
     }
   },
   async remove(path) {
-    await del(path, { abortSignal: AbortSignal.timeout(10000) });
+    await del(path, {
+      token: process.env.BLOB_READ_WRITE_TOKEN || undefined,
+      abortSignal: AbortSignal.timeout(10000),
+    });
   },
 };
 export function audioConfigured() {
-  return Boolean(process.env.BLOB_READ_WRITE_TOKEN);
+  return Boolean(
+    process.env.BLOB_READ_WRITE_TOKEN?.trim() ||
+    (process.env.BLOB_STORE_ID?.trim() &&
+      (process.env.VERCEL_OIDC_TOKEN?.trim() || process.env.VERCEL === "1")),
+  );
 }
 function requireStorage() {
   if (!audioConfigured())

@@ -10,6 +10,7 @@ let provider: WebSocketServer;
 let gateway: WebSocketServer;
 let endpoint: string;
 let gatewayUrl: string;
+let lastAuthorization: string | undefined;
 before(async () => {
   provider = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   await new Promise<void>((resolve) => provider.on("listening", resolve));
@@ -17,7 +18,17 @@ before(async () => {
   if (!address || typeof address === "string")
     throw new Error("invalid address");
   endpoint = `ws://127.0.0.1:${address.port}/realtime`;
-  provider.on("connection", (socket) => {
+  provider.on("connection", (socket, request) => {
+    lastAuthorization = request.headers.authorization;
+    if (request.url?.includes("reject=true")) {
+      socket.send(
+        JSON.stringify({
+          code: "InvalidParameter",
+          message: "Model not exist.",
+        }),
+      );
+      return;
+    }
     socket.send(JSON.stringify({ type: "session.created" }));
     socket.on("message", (raw) => {
       const data = JSON.parse(raw.toString());
@@ -254,4 +265,36 @@ test("PCM worklet keeps sample phase across blocks and flushes the last samples"
     for (const buffer of sent)
       assert.equal(new DataView(buffer).getInt16(0, true), 16384);
   }
+});
+
+test("empty dedicated ASR key falls back to text key; a nonempty dedicated key takes priority", async () => {
+  const previousText = process.env.DASHSCOPE_API_KEY;
+  const previousAsr = process.env.DASHSCOPE_ASR_API_KEY;
+  try {
+    process.env.DASHSCOPE_API_KEY = "fixture-text-key";
+    process.env.DASHSCOPE_ASR_API_KEY = "";
+    await transcribePcm(Buffer.alloc(3200), { endpoint });
+    assert.equal(lastAuthorization, "Bearer fixture-text-key");
+    process.env.DASHSCOPE_ASR_API_KEY = "fixture-asr-key";
+    await transcribePcm(Buffer.alloc(3200), { endpoint });
+    assert.equal(lastAuthorization, "Bearer fixture-asr-key");
+  } finally {
+    if (previousText === undefined) delete process.env.DASHSCOPE_API_KEY;
+    else process.env.DASHSCOPE_API_KEY = previousText;
+    if (previousAsr === undefined) delete process.env.DASHSCOPE_ASR_API_KEY;
+    else process.env.DASHSCOPE_ASR_API_KEY = previousAsr;
+  }
+});
+test("an upstream rejection without an event type is an immediate failure", async () => {
+  const started = Date.now();
+  await assert.rejects(
+    transcribePcm(Buffer.alloc(3200), {
+      key: "fixture",
+      endpoint: endpoint + "?reject=true",
+    }),
+  );
+  assert.ok(
+    Date.now() - started < 2000,
+    "provider error must not wait for the session-ready timeout",
+  );
 });

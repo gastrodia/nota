@@ -14,7 +14,10 @@ function connectAsr(
   onError: () => void,
   config: AsrConfig = {},
 ) {
-  const key = config.key ?? process.env.DASHSCOPE_API_KEY;
+  const key =
+    config.key ??
+    (process.env.DASHSCOPE_ASR_API_KEY?.trim() ||
+      process.env.DASHSCOPE_API_KEY?.trim());
   if (!key) throw new AppError(503, "ASR_NOT_CONFIGURED", "语音识别尚未配置。");
   const endpoint = new URL(
     config.endpoint ??
@@ -51,6 +54,8 @@ function connectAsr(
     if (cancelled) return;
     try {
       const value = JSON.parse(data.toString()) as Record<string, unknown>;
+      if (typeof value.code === "string" && !value.type)
+        throw new Error("asr_provider_rejected");
       if (value.type === "session.created")
         upstream.send(
           JSON.stringify({

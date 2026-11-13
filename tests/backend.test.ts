@@ -225,14 +225,24 @@ test("tool crash replay uses the same side-effect result", async () => {
   const u = await user();
   const made = await createJob(u.id, input());
   const job = (await claimJob(u.id, made.id))!;
-  const a = await executeTool(job, "create_todo", {
-    title: "发送报价单",
-    due_at: null,
-  });
-  const b = await executeTool(job, "create_todo", {
-    due_at: null,
-    title: "发送报价单",
-  });
+  const a = await executeTool(
+    job,
+    "create_todo",
+    {
+      title: "发送报价单",
+      due_at: null,
+    },
+    true,
+  );
+  const b = await executeTool(
+    job,
+    "create_todo",
+    {
+      due_at: null,
+      title: "发送报价单",
+    },
+    true,
+  );
   assert.equal(a.todo!.id, b.todo!.id);
   assert.equal(
     Number(
@@ -471,5 +481,65 @@ test("HTTP handlers complete login, job, tool, todo, source and logout flow", as
       )
     ).status,
     403,
+  );
+});
+
+test("a proposed write rejected by intent validation never creates a todo", async () => {
+  const u = await user();
+  const job = await createJob(u.id, input("不要创建待办，只记录客户的安排"));
+  await runJob(u.id, job.id);
+  const result = await getJob(u.id, job.id);
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.result!.todos.length, 0);
+  assert.equal(
+    Number(
+      (await query("SELECT count(*) FROM todos WHERE user_id=$1", [u.id]))
+        .rows[0].count,
+    ),
+    0,
+  );
+  assert.ok(
+    result.events.some(
+      (e) =>
+        e.type === "tool_result" &&
+        e.payload.name === "create_todo" &&
+        (e.payload.result as { ok: boolean }).ok === false,
+    ),
+  );
+});
+
+test("search retains a missing entity instead of returning records matching only a generic word", async () => {
+  const u = await user();
+  await query(
+    "INSERT INTO notes(user_id,title,transcript,status) VALUES($1,'海星客户报价','客户报价8万元','ready')",
+    [u.id],
+  );
+  const made = await createJob(
+    u.id,
+    input("查询ZX999客户账号", { kind: "chat" }),
+  );
+  const job = (await claimJob(u.id, made.id))!;
+  const result = await executeTool(job, "search_notes", {
+    query: "ZX999 客户",
+    start_date: null,
+    end_date: null,
+  });
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.sources, []);
+});
+
+test("origin validation accepts actual host after Next normalizes an internal localhost URL", () => {
+  const request = new Request("http://localhost:3107/api/jobs", {
+    headers: { Host: "127.0.0.1:3107", Origin: "http://127.0.0.1:3107" },
+  });
+  assert.doesNotThrow(() => assertOrigin(request));
+  assert.throws(
+    () =>
+      assertOrigin(
+        new Request("http://localhost:3107/api/jobs", {
+          headers: { Host: "127.0.0.1:3107", Origin: "https://evil.example" },
+        }),
+      ),
+    (e: unknown) => e instanceof AppError && e.status === 403,
   );
 });

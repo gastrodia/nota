@@ -8,7 +8,10 @@ export const maxDuration = 120;
 async function authorize(request: Request) {
   assertOrigin(request);
   const user = await requireUser(request);
-  if (process.env.NOTA_TEST_MODE === "1" || !process.env.DASHSCOPE_API_KEY)
+  if (
+    process.env.NOTA_TEST_MODE === "1" ||
+    !(process.env.DASHSCOPE_ASR_API_KEY || process.env.DASHSCOPE_API_KEY)
+  )
     throw new AppError(503, "ASR_NOT_CONFIGURED", "语音识别尚未配置。");
   if ((await quota(user.id)).remaining < 1)
     throw new AppError(429, "DAILY_QUOTA_EXCEEDED", "今天的AI额度已用完。");

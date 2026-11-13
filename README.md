@@ -30,14 +30,15 @@ cp .env.example .env.local
 
 在 `.env.local` 中填写以下配置：
 
-| 变量                    | 用途                                |
-| ----------------------- | ----------------------------------- |
-| `DATABASE_URL`          | 项目专用的 Neon PostgreSQL 连接串   |
-| `DASHSCOPE_API_KEY`     | 阿里云百炼 API Key                  |
-| `BLOB_READ_WRITE_TOKEN` | 私有 Vercel Blob 存储的访问 Token   |
-| `APP_URL`               | 部署后的 HTTPS 地址，本地开发可留空 |
+| 变量                    | 用途                                 |
+| ----------------------- | ------------------------------------ |
+| `DATABASE_URL`          | 项目专用的 Neon PostgreSQL 连接串    |
+| `DASHSCOPE_API_KEY`     | 阿里云百炼文本模型 API Key           |
+| `DASHSCOPE_ASR_API_KEY` | 可选，语音使用不同工作空间时单独配置 |
+| `BLOB_READ_WRITE_TOKEN` | 私有 Vercel Blob 存储的访问 Token    |
+| `APP_URL`               | 部署后的 HTTPS 地址，本地开发可留空  |
 
-模型名称与接口地址已在 [.env.example](.env.example) 中提供默认值，接口地域需与百炼 Key 对应。
+模型名称与接口地址已在 [.env.example](.env.example) 中提供默认值，接口地域需与对应 Key 一致。语音 WebSocket 路径为 `/api-ws/v1/realtime`；若语音与文本使用不同工作空间，可单独设置 `DASHSCOPE_ASR_API_KEY`。Blob 也支持私有存储的 Vercel OIDC 鉴权。
 
 ```bash
 pnpm db:migrate
