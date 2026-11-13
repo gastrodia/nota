@@ -42,7 +42,7 @@ cp .env.example .env.local
 
 模型名称与接口地址已在 [.env.example](.env.example) 中提供默认值，接口地域需与对应 Key 一致。语音 WebSocket 路径为 `/api-ws/v1/realtime`；若语音与文本使用不同工作空间，可单独设置 `DASHSCOPE_ASR_API_KEY`。Blob 也支持私有存储的 Vercel OIDC 鉴权。
 
-本地与 Vercel 环境变量独立维护；修改 Vercel 配置后需要重新部署。当前线上文本已通过联调，香港工作空间的实时语音模型仍返回不可用，验证范围见[验证记录](docs/verification.md)。
+本地与 Vercel 环境变量独立维护；修改 Vercel 配置后需要重新部署。当前线上香港文本与新加坡实时语音已通过联调，验证范围见[验证记录](docs/verification.md)。
 
 ```bash
 pnpm db:migrate
