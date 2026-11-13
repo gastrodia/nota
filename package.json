@@ -15,10 +15,11 @@
     "cleanup:audio": "tsx scripts/cleanup-audio.ts",
     "test:backend": "tsx --test tests/backend.test.ts",
     "test:asr": "tsx --test tests/asr.test.ts",
-    "test": "pnpm test:recorder && pnpm test:backend && pnpm test:asr",
+    "test": "pnpm test:recorder && pnpm test:backend && pnpm test:asr && pnpm test:evaluation",
     "test:local": "tsx scripts/test-local.ts",
     "preview:test": "tsx scripts/preview-test.ts",
-    "eval:live": "tsx scripts/evaluate.ts"
+    "eval:live": "tsx scripts/evaluate.ts",
+    "test:evaluation": "tsx --test tests/evaluation.test.ts"
   },
   "dependencies": {
     "@vercel/blob": "^2.9.0",

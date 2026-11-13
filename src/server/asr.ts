@@ -28,83 +28,123 @@ function connectAsr(
     "model",
     config.model ?? process.env.QWEN_ASR_MODEL ?? "qwen3-asr-flash-realtime",
   );
-  const upstream = new WebSocket(endpoint, {
-    headers: { Authorization: `Bearer ${key}` },
-    handshakeTimeout: 10000,
-    maxPayload: 256 * 1024,
-  });
   const transcript = new TranscriptAccumulator();
+  let upstream: WebSocket | undefined;
   let ready = false;
   let finished = false;
   let cancelled = false;
-  const timer = setTimeout(() => {
-    if (!ready) {
-      onError();
-      cancel();
-    }
-  }, 12000);
+  let attempt = 0;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   function cancel() {
     if (cancelled) return;
     cancelled = true;
-    clearTimeout(timer);
-    if (upstream.readyState === WebSocket.CONNECTING) upstream.terminate();
-    else if (upstream.readyState !== WebSocket.CLOSED) upstream.close();
+    if (timer) clearTimeout(timer);
+    if (upstream?.readyState === WebSocket.CONNECTING) upstream.terminate();
+    else if (upstream && upstream.readyState !== WebSocket.CLOSED)
+      upstream.close();
   }
-  upstream.on("message", (data) => {
-    if (cancelled) return;
-    try {
-      const value = JSON.parse(data.toString()) as Record<string, unknown>;
-      if (typeof value.code === "string" && !value.type)
-        throw new Error("asr_provider_rejected");
-      if (value.type === "session.created")
-        upstream.send(
-          JSON.stringify({
-            event_id: crypto.randomUUID(),
-            type: "session.update",
-            session: {
-              input_audio_format: "pcm",
-              sample_rate: 16000,
-              input_audio_transcription: { language: "zh" },
-              turn_detection: {
-                type: "server_vad",
-                threshold: 0.2,
-                silence_duration_ms: 800,
-              },
-            },
-          }),
-        );
-      if (value.type === "session.updated" && !ready) {
-        ready = true;
-        clearTimeout(timer);
-        onReady();
-      }
-      const result = transcript.apply(value);
-      if (
-        value.type === "conversation.item.input_audio_transcription.text" ||
-        value.type === "conversation.item.input_audio_transcription.completed"
-      )
-        onText(result.text);
-      if (result.finished) {
-        finished = true;
-        onFinish(result.text);
-        cancel();
-      }
-    } catch {
-      onError();
-      cancel();
-    }
-  });
-  upstream.on("error", () => {
-    if (!cancelled && !finished) onError();
+  function fail() {
+    if (cancelled || finished) return;
+    onError();
     cancel();
-  });
-  upstream.on("close", () => {
-    if (!cancelled && !finished) onError();
-    clearTimeout(timer);
-  });
+  }
+  function connect() {
+    if (cancelled) return;
+    attempt++;
+    const socket = new WebSocket(endpoint, {
+      headers: { Authorization: `Bearer ${key}` },
+      handshakeTimeout: 10000,
+      maxPayload: 256 * 1024,
+    });
+    upstream = socket;
+    const retry = (reason: string) => {
+      if (cancelled || finished || upstream !== socket) return;
+      if (timer) clearTimeout(timer);
+      if (!ready && attempt < 2) {
+        console.warn("nota_asr_connection_retry", { attempt, reason });
+        // No audio is accepted before ready, so reconnecting here cannot duplicate audio.
+        upstream = undefined;
+        socket.terminate();
+        connect();
+      } else fail();
+    };
+    timer = setTimeout(() => {
+      if (!ready) retry("session_ready_timeout");
+    }, 12000);
+    socket.on("message", (data) => {
+      if (cancelled || upstream !== socket) return;
+      try {
+        const value = JSON.parse(data.toString()) as Record<string, unknown>;
+        if (typeof value.code === "string" && !value.type) {
+          console.error("nota_asr_provider_rejected", { code: value.code });
+          throw new Error("asr_provider_rejected");
+        }
+        if (value.type === "error") {
+          const error = value.error as { code?: unknown } | undefined;
+          console.error("nota_asr_provider_error", {
+            code: typeof error?.code === "string" ? error.code : "unknown",
+          });
+        }
+        if (value.type === "session.created")
+          socket.send(
+            JSON.stringify({
+              event_id: crypto.randomUUID(),
+              type: "session.update",
+              session: {
+                input_audio_format: "pcm",
+                sample_rate: 16000,
+                input_audio_transcription: { language: "zh" },
+                turn_detection: {
+                  type: "server_vad",
+                  threshold: 0.2,
+                  silence_duration_ms: 800,
+                },
+              },
+            }),
+          );
+        if (value.type === "session.updated" && !ready) {
+          ready = true;
+          if (timer) clearTimeout(timer);
+          onReady();
+        }
+        const result = transcript.apply(value);
+        if (
+          value.type === "conversation.item.input_audio_transcription.text" ||
+          value.type === "conversation.item.input_audio_transcription.completed"
+        )
+          onText(result.text);
+        if (result.finished) {
+          finished = true;
+          onFinish(result.text);
+          cancel();
+        }
+      } catch {
+        fail();
+      }
+    });
+    socket.on("error", (error: Error & { code?: string }) => {
+      if (cancelled || upstream !== socket) return;
+      const status = /Unexpected server response: (\d{3})/.exec(
+        error.message,
+      )?.[1];
+      const reason = error.message.includes("timed out")
+        ? "handshake_timeout"
+        : status
+          ? `http_${status}`
+          : (error.code ?? "network_error");
+      console.error("nota_asr_transport_error", { name: error.name, reason });
+      if (status && !status.startsWith("5")) fail();
+      else retry(reason);
+    });
+    socket.on("close", () => {
+      if (!cancelled && !finished && upstream === socket)
+        retry("connection_closed");
+    });
+  }
+  connect();
   return {
     send(audio: string) {
-      if (!ready || upstream.readyState !== WebSocket.OPEN)
+      if (!ready || upstream?.readyState !== WebSocket.OPEN)
         throw new Error("asr_not_ready");
       upstream.send(
         JSON.stringify({
@@ -115,7 +155,7 @@ function connectAsr(
       );
     },
     finish() {
-      if (ready && upstream.readyState === WebSocket.OPEN)
+      if (ready && upstream?.readyState === WebSocket.OPEN)
         upstream.send(
           JSON.stringify({
             event_id: crypto.randomUUID(),
@@ -126,6 +166,7 @@ function connectAsr(
     cancel,
   };
 }
+
 export function bridgeAsr(client: WebSocket, config: AsrConfig = {}) {
   let bytes = 0;
   let ready = false;

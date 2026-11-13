@@ -82,6 +82,7 @@ async function callModel(
   if (!key)
     throw new AppError(503, "MODEL_NOT_CONFIGURED", "AI 服务尚未配置。");
   let response: Response;
+  const started = Date.now();
   try {
     response = await fetch(
       `${(process.env.QWEN_BASE_URL ?? "https://dashscope.aliyuncs.com/compatible-mode/v1").replace(/\/$/, "")}/chat/completions`,
@@ -124,7 +125,16 @@ async function callModel(
         signal: AbortSignal.timeout(40000),
       },
     );
-  } catch {
+  } catch (error) {
+    const cause =
+      error instanceof Error
+        ? (error.cause as { code?: unknown } | undefined)
+        : undefined;
+    console.error("nota_model_transport_error", {
+      name: error instanceof Error ? error.name : "unknown",
+      code: typeof cause?.code === "string" ? cause.code : undefined,
+      elapsed_ms: Date.now() - started,
+    });
     throw new AppError(
       502,
       "MODEL_UNAVAILABLE",

@@ -91,7 +91,7 @@ export class RealtimeTranscriber {
       const timeout = setTimeout(() => {
         reject(new Error("实时转写连接超时。"));
         this.cancel();
-      }, 12000);
+      }, 30000);
       socket.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);

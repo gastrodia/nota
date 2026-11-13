@@ -11,6 +11,8 @@ let gateway: WebSocketServer;
 let endpoint: string;
 let gatewayUrl: string;
 let lastAuthorization: string | undefined;
+let retryConnections = 0;
+let failedConnections = 0;
 before(async () => {
   provider = new WebSocketServer({ host: "127.0.0.1", port: 0 });
   await new Promise<void>((resolve) => provider.on("listening", resolve));
@@ -20,6 +22,18 @@ before(async () => {
   endpoint = `ws://127.0.0.1:${address.port}/realtime`;
   provider.on("connection", (socket, request) => {
     lastAuthorization = request.headers.authorization;
+    if (request.url?.includes("always-close=true")) {
+      failedConnections++;
+      socket.terminate();
+      return;
+    }
+    if (request.url?.includes("retry=true")) {
+      retryConnections++;
+      if (retryConnections === 1) {
+        socket.terminate();
+        return;
+      }
+    }
     if (request.url?.includes("reject=true")) {
       socket.send(
         JSON.stringify({
@@ -297,4 +311,25 @@ test("an upstream rejection without an event type is an immediate failure", asyn
     Date.now() - started < 2000,
     "provider error must not wait for the session-ready timeout",
   );
+});
+
+test("an initial connection failure retries before any audio and finishes once", async () => {
+  retryConnections = 0;
+  const text = await transcribePcm(Buffer.alloc(3200), {
+    key: "fixture",
+    endpoint: endpoint + "?retry=true",
+  });
+  assert.equal(retryConnections, 2);
+  assert.equal(text, "今天报价八万元");
+});
+
+test("initial connection retries stop after two unsuccessful attempts", async () => {
+  failedConnections = 0;
+  await assert.rejects(
+    transcribePcm(Buffer.alloc(3200), {
+      key: "fixture",
+      endpoint: endpoint + "?always-close=true",
+    }),
+  );
+  assert.equal(failedConnections, 2);
 });
