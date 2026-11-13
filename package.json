@@ -1,0 +1,48 @@
+{
+  "name": "nota",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "test:recorder": "node --test tests/voice-recorder.test.mjs",
+    "format": "prettier --write src docs tests scripts public/audio README.md package.json",
+    "format:check": "prettier --check src docs tests scripts public/audio README.md package.json",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "cleanup:audio": "tsx scripts/cleanup-audio.ts",
+    "test:backend": "tsx --test tests/backend.test.ts",
+    "test:asr": "tsx --test tests/asr.test.ts",
+    "test": "pnpm test:recorder && pnpm test:backend && pnpm test:asr",
+    "test:local": "tsx scripts/test-local.ts",
+    "preview:test": "tsx scripts/preview-test.ts",
+    "eval:live": "tsx scripts/evaluate.ts"
+  },
+  "dependencies": {
+    "@vercel/blob": "^2.9.0",
+    "@vercel/functions": "^3.11.1",
+    "next": "16.4.6",
+    "pg": "^8.23.1",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "ws": "^8.22.2",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@types/ws": "^8.18.2",
+    "dotenv": "^18.0.10",
+    "eslint": "^9",
+    "eslint-config-next": "16.4.6",
+    "jsdom": "26.1.0",
+    "prettier": "^3.10.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5"
+  },
+  "packageManager": "pnpm@11.15.1"
+}
