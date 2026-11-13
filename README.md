@@ -1,6 +1,6 @@
 # Nota
 
-[在线体验](https://nota-seven-red.vercel.app)
+[在线预览](https://nota-seven-red.vercel.app)
 
 一个移动端优先的 AI 语音便签应用。说一段话或输入文字，整理成摘要与待办；需要回顾时，通过 Agent 查询历史记录、查看原文来源。
 
