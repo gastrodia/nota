@@ -9,6 +9,7 @@ import {
   currentUser,
   destroySession,
   sessionHeader,
+  throttle,
 } from "../src/server/auth";
 import {
   createJob,
@@ -16,6 +17,7 @@ import {
   quota,
   getJob,
   failJob,
+  listConversationJobs,
 } from "../src/server/jobs";
 import { runJob } from "../src/server/agent";
 import { executeTool } from "../src/server/tools";
@@ -24,8 +26,10 @@ import {
   updateTodo,
   deleteNote,
   newNote,
+  listNotes,
 } from "../src/server/repository";
-import { query, closeDatabase } from "../src/server/db";
+import { query, closeDatabase, ormTransaction } from "../src/server/db";
+import { notes } from "../src/server/schema";
 import { assertOrigin, AppError } from "../src/server/errors";
 import {
   storeAudio,
@@ -79,6 +83,163 @@ async function expectCode(promise: Promise<unknown>, status: number) {
   );
 }
 
+test("ORM auth preserves duplicate-email errors, atomic throttling and session expiry", async () => {
+  const u = await user();
+  await expectCode(register(u.email, "nota-test-password"), 409);
+  assert.deepEqual(await login(u.email, "nota-test-password"), u);
+  await expectCode(login(u.email, "wrong-password"), 401);
+  const key = `orm-throttle:${randomUUID()}`;
+  const attempts = await Promise.allSettled(
+    Array.from({ length: 8 }, () => throttle(key, 3)),
+  );
+  assert.equal(attempts.filter((r) => r.status === "fulfilled").length, 3);
+  for (const result of attempts) {
+    if (result.status === "rejected") {
+      assert.ok(result.reason instanceof AppError);
+      assert.equal(result.reason.status, 429);
+    }
+  }
+  const token = await createSession(u.id);
+  const request = new Request("http://localhost/api/me", {
+    headers: { Cookie: `nota_session=${token}` },
+  });
+  assert.deepEqual(await currentUser(request), u);
+  await query(
+    "UPDATE sessions SET expires_at=now()-interval '1 second' WHERE user_id=$1",
+    [u.id],
+  );
+  assert.equal(await currentUser(request), null);
+});
+
+test("ORM notes preserve literal search, ownership, idempotency and date serialization", async () => {
+  const a = await user(),
+    b = await user();
+  const id = randomUUID();
+  const literal = "折扣100%_\\原文";
+  const note = await newNote(a.id, { id, transcript: literal });
+  await newNote(a.id, { transcript: "折扣100其他原文" });
+  await newNote(b.id, { transcript: literal });
+  assert.equal(note.source, "voice");
+  assert.equal(note.duration_seconds, null);
+  assert.equal(
+    (await newNote(a.id, { id, transcript: "重试不得覆盖" })).transcript,
+    literal,
+  );
+  await expectCode(newNote(b.id, { id }), 409);
+  for (const term of ["%", "_", "\\", "100%_\\", "' OR 1=1 --"]) {
+    const found = await listNotes(a.id, term);
+    assert.deepEqual(
+      found.map((n) => n.id),
+      term.startsWith("'") ? [] : [id],
+    );
+  }
+  const found = (await listNotes(a.id, literal))[0];
+  assert.equal(found.has_audio, false);
+  assert.equal(found.created_at.toISOString(), note.created_at.toISOString());
+  assert.equal(
+    JSON.parse(JSON.stringify(found)).created_at,
+    note.created_at.toISOString(),
+  );
+});
+
+test("ORM transaction rolls back writes on the checked-out PostgreSQL connection", async () => {
+  const u = await user();
+  const failure = new Error("rollback-test");
+  await assert.rejects(
+    ormTransaction(async (db) => {
+      await db
+        .insert(notes)
+        .values({ user_id: u.id, transcript: "must roll back" });
+      throw failure;
+    }),
+    (error: unknown) => error === failure,
+  );
+  assert.equal(
+    (await query("SELECT id FROM notes WHERE user_id=$1", [u.id])).rowCount,
+    0,
+  );
+});
+
+test("ORM conversation history isolates users and serializes events and dates", async () => {
+  const a = await user(),
+    b = await user();
+  const conversation_id = randomUUID();
+  const first = await createJob(
+    a.id,
+    input("只记录第一次交谈", { kind: "chat", conversation_id }),
+  );
+  await runJob(a.id, first.id);
+  const second = await createJob(
+    a.id,
+    input("只记录第二次交谈", { kind: "chat", conversation_id }),
+  );
+  await runJob(a.id, second.id);
+  await createJob(b.id, input("其他账户", { kind: "chat", conversation_id }));
+  await createJob(a.id, input("不属于对话的便签", { conversation_id }));
+  const history = await listConversationJobs(a.id, conversation_id);
+  assert.deepEqual(
+    history.map((j) => j.id),
+    [first.id, second.id],
+  );
+  for (const job of history) {
+    assert.equal(new Date(job.created_at).toISOString(), job.created_at);
+    assert.ok(job.events.length > 0);
+    assert.ok(job.events.every((e) => /^\d+$/.test(e.id)));
+    assert.ok(
+      job.events.every(
+        (e) => new Date(e.created_at).toISOString() === e.created_at,
+      ),
+    );
+  }
+  assert.doesNotThrow(() => JSON.stringify(history));
+});
+
+test("conversation HTTP history restores note clarification questions after a reload", async () => {
+  const a = await user(),
+    b = await user();
+  const conversation_id = randomUUID();
+  const clarification = await createJob(
+    a.id,
+    input("下午发送报价单", { conversation_id }),
+  );
+  const hidden = await createJob(a.id, input("普通便签", { conversation_id }));
+  const other = await createJob(
+    b.id,
+    input("其他账户的问题", { conversation_id }),
+  );
+  const result = {
+    title: "发送报价单",
+    summary: "下午发送报价单",
+    answer: "请问具体日期和几点？",
+    source_note_ids: [],
+    sources: [],
+    todos: [],
+    needs_clarification: true,
+  };
+  await query(
+    "UPDATE jobs SET status='succeeded',result=$1 WHERE id=ANY($2::uuid[])",
+    [JSON.stringify(result), [clarification.id, other.id]],
+  );
+  const token = await createSession(a.id);
+  const response = await GET(
+    new Request(
+      `http://localhost/api/jobs?conversation_id=${conversation_id}`,
+      { headers: { Cookie: `nota_session=${token}` } },
+    ),
+  );
+  assert.equal(response.status, 200);
+  const history = (await response.json()).jobs as {
+    id: string;
+    result: typeof result;
+  }[];
+  assert.deepEqual(
+    history.map((job) => job.id),
+    [clarification.id],
+  );
+  assert.equal(history[0].result.answer, result.answer);
+  assert.ok(!history.some((job) => job.id === hidden.id));
+});
+
 test("30 concurrent distinct jobs accept exactly 10, without orphan notes", async () => {
   const u = await user();
   const results = await Promise.allSettled(
@@ -109,6 +270,248 @@ test("same idempotency key submitted concurrently creates one task and one charg
     409,
   );
   assert.equal((await quota(u.id)).used, 1);
+});
+
+test("different request keys for one recording reserve once and retain every payload binding", async () => {
+  const u = await user();
+  const note = await newNote(u.id, { transcript: "原始录音", source: "voice" });
+  const requests = Array.from({ length: 20 }, () =>
+    input("创建发送报价单的待办", { note_id: note.id }),
+  );
+  const results = await Promise.all(
+    requests.map((request) => createJob(u.id, request)),
+  );
+  assert.equal(new Set(results.map((result) => result.id)).size, 1);
+  assert.equal(results.filter((result) => !result.reused).length, 1);
+  assert.equal((await quota(u.id)).used, 1);
+  assert.equal(
+    Number(
+      (
+        await query("SELECT count(*) FROM job_requests WHERE user_id=$1", [
+          u.id,
+        ])
+      ).rows[0].count,
+    ),
+    20,
+  );
+  await expectCode(
+    createJob(u.id, { ...requests[1], input: "不同内容", note_id: undefined }),
+    409,
+  );
+  await expectCode(
+    createJob(u.id, input("修改后的内容", { note_id: note.id })),
+    409,
+  );
+  assert.equal((await quota(u.id)).used, 1);
+});
+
+test("a failed recording replayed with a new request key resumes its original tool ledger", async () => {
+  const u = await user();
+  const text = `创建待办 fail-after ${randomUUID()}`;
+  const note = await newNote(u.id, { transcript: text, source: "voice" });
+  const first = await createJob(u.id, input(text, { note_id: note.id }));
+  await assert.rejects(runJob(u.id, first.id));
+  assert.equal((await getJob(u.id, first.id)).status, "failed");
+  const replay = await createJob(u.id, input(text, { note_id: note.id }));
+  assert.equal(replay.id, first.id);
+  assert.equal(replay.reused, true);
+  await runJob(u.id, replay.id);
+  assert.equal((await getJob(u.id, first.id)).status, "succeeded");
+  assert.equal((await quota(u.id)).used, 1);
+  assert.equal(
+    Number(
+      (await query("SELECT count(*) FROM todos WHERE note_id=$1", [note.id]))
+        .rows[0].count,
+    ),
+    1,
+  );
+  const completedReplay = await createJob(
+    u.id,
+    input(text, { note_id: note.id }),
+  );
+  assert.equal(completedReplay.id, first.id);
+  assert.equal((await quota(u.id)).used, 1);
+  const other = await user();
+  await expectCode(createJob(other.id, input(text, { note_id: note.id })), 404);
+  assert.equal((await quota(other.id)).used, 0);
+});
+
+test("failed recording without side effects reuses its task and reserves only when retried", async () => {
+  const u = await user();
+  const text = `fail-before ${randomUUID()}`;
+  const note = await newNote(u.id, { transcript: text, source: "voice" });
+  const first = await createJob(u.id, input(text, { note_id: note.id }));
+  await assert.rejects(runJob(u.id, first.id));
+  assert.equal((await quota(u.id)).used, 0);
+  const replay = await createJob(u.id, input(text, { note_id: note.id }));
+  assert.equal(replay.id, first.id);
+  assert.equal((await quota(u.id)).used, 0);
+  await runJob(u.id, replay.id);
+  assert.equal((await quota(u.id)).used, 1);
+  assert.equal((await getJob(u.id, replay.id)).status, "succeeded");
+});
+
+test("task failure events distinguish retryable transport errors from configuration failures", async () => {
+  const u = await user();
+  for (const [code, retryable] of [
+    ["MODEL_UNAVAILABLE", true],
+    ["MODEL_REQUEST_REJECTED", false],
+    ["MODEL_NOT_CONFIGURED", false],
+  ] as const) {
+    const created = await createJob(u.id, input());
+    const claimed = (await claimJob(u.id, created.id))!;
+    await failJob(claimed, new AppError(502, code, "合成失败"));
+    const failure = (await getJob(u.id, created.id)).events.find(
+      (event) => event.type === "failed",
+    )!;
+    assert.equal(failure.payload.code, code);
+    assert.equal(failure.payload.retryable, retryable);
+  }
+});
+
+test("concurrent clarification resolutions share one action and conflicting or deleted actions are not recreated", async () => {
+  const u = await user();
+  const conversationId = randomUUID();
+  const originalInput = "帮我创建发送报价单的待办，请先问我具体时间。";
+  const origin = await createJob(u.id, {
+    kind: "chat",
+    input: originalInput,
+    conversation_id: conversationId,
+    idempotency_key: randomUUID(),
+  });
+  await query(
+    "UPDATE jobs SET status='succeeded',quota_state='consumed',agent_state=$1 WHERE id=$2",
+    [
+      JSON.stringify({ clarification: { origin_job_id: origin.id } }),
+      origin.id,
+    ],
+  );
+  const supplement = "2026年12月15日下午三点。";
+  async function followup(text = supplement) {
+    const created = await createJob(u.id, {
+      kind: "chat",
+      input: text,
+      conversation_id: conversationId,
+      idempotency_key: randomUUID(),
+    });
+    return (await claimJob(u.id, created.id))!;
+  }
+  const [first, second] = await Promise.all([followup(), followup()]);
+  const resolution = {
+    origin_job_id: origin.id,
+    source_text: "不可信的归纳来源",
+  };
+  const args = { title: "发送报价单", due_at: "2026-12-15T15:00:00+08:00" };
+  const results = await Promise.all([
+    executeTool(first, "create_todo", args, true, resolution),
+    executeTool(
+      second,
+      "create_todo",
+      { ...args, due_at: "2026-12-15T07:00:00Z" },
+      true,
+      resolution,
+    ),
+  ]);
+  assert.equal(results[0].todo!.id, results[1].todo!.id);
+  for (const result of results) {
+    assert.equal(result.ok, true);
+    assert.ok(result.todo!.source_text.includes(originalInput));
+    assert.ok(result.todo!.source_text.includes(supplement));
+    assert.ok(!result.todo!.source_text.includes(resolution.source_text));
+  }
+  const count = async () =>
+    Number(
+      (await query("SELECT count(*) FROM todos WHERE user_id=$1", [u.id]))
+        .rows[0].count,
+    );
+  assert.equal(await count(), 1);
+  assert.equal(
+    Number(
+      (
+        await query(
+          "SELECT count(*) FROM tool_runs WHERE job_id=ANY($1::uuid[]) AND has_effect",
+          [[first.id, second.id]],
+        )
+      ).rows[0].count,
+    ),
+    1,
+  );
+  const conflict = await executeTool(
+    await followup("改为下午四点。"),
+    "create_todo",
+    { ...args, due_at: "2026-12-15T16:00:00+08:00" },
+    true,
+    resolution,
+  );
+  assert.equal(conflict.ok, false);
+  assert.equal(conflict.needs_clarification, true);
+  assert.equal(await count(), 1);
+  await query("DELETE FROM todos WHERE id=$1", [results[0].todo!.id]);
+  const deleted = await executeTool(
+    await followup(),
+    "create_todo",
+    args,
+    true,
+    resolution,
+  );
+  assert.equal(deleted.ok, false);
+  assert.match(deleted.clarification!, /已删除/);
+  assert.equal(await count(), 0);
+  // An explicitly independent action has no inherited resolution identity.
+  const independent = await executeTool(
+    await followup("独立新建另一条发送报价单的待办。"),
+    "create_todo",
+    args,
+    true,
+  );
+  assert.equal(independent.ok, true);
+  assert.equal(await count(), 1);
+});
+
+test("a clarification identity cannot be borrowed from another account or conversation", async () => {
+  const a = await user(),
+    b = await user();
+  const conversationId = randomUUID();
+  const origin = await createJob(a.id, {
+    kind: "chat",
+    input: "创建待办并追问时间",
+    conversation_id: conversationId,
+    idempotency_key: randomUUID(),
+  });
+  await query("UPDATE jobs SET status='succeeded',agent_state=$1 WHERE id=$2", [
+    JSON.stringify({ clarification: { origin_job_id: origin.id } }),
+    origin.id,
+  ]);
+  for (const [owner, conversation] of [
+    [b, conversationId],
+    [a, randomUUID()],
+  ] as const) {
+    const created = await createJob(owner.id, {
+      kind: "chat",
+      input: "下午三点",
+      conversation_id: conversation,
+      idempotency_key: randomUUID(),
+    });
+    const result = await executeTool(
+      (await claimJob(owner.id, created.id))!,
+      "create_todo",
+      { title: "发送报价单", due_at: null },
+      true,
+      { origin_job_id: origin.id, source_text: "" },
+    );
+    assert.equal(result.ok, false);
+  }
+  assert.equal(
+    Number(
+      (
+        await query(
+          "SELECT count(*) FROM todos WHERE user_id=ANY($1::uuid[])",
+          [[a.id, b.id]],
+        )
+      ).rows[0].count,
+    ),
+    0,
+  );
 });
 test("text pipeline creates a real todo and replay does not execute it twice", async () => {
   const u = await user();

@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import type { PoolClient } from "pg";
-import { transaction, query } from "./db";
+import { and, asc, desc, eq, or, sql } from "drizzle-orm";
+import { transaction, query, orm } from "./db";
+import { jobs, jobEvents } from "./schema";
 import { AppError } from "./errors";
 import {
   jobInputSchema,
@@ -8,24 +10,7 @@ import {
   type Quota,
   type AgentResult,
 } from "../lib/contracts";
-export interface DbJob {
-  id: string;
-  user_id: string;
-  kind: "note" | "chat";
-  input: string;
-  conversation_id: string | null;
-  note_id: string | null;
-  status: PublicJob["status"];
-  quota_day: string;
-  quota_state: "reserved" | "consumed" | "refunded";
-  attempt: number;
-  fence: number;
-  lease_until: Date | null;
-  agent_state: Record<string, unknown>;
-  result: AgentResult | null;
-  error: string | null;
-  created_at: Date;
-}
+export type DbJob = typeof jobs.$inferSelect;
 export const timeZone = "Asia/Shanghai";
 export async function event(
   client: PoolClient,
@@ -85,7 +70,7 @@ export async function createJob(userId: string, raw: unknown) {
       `${userId}:${input.idempotency_key}`,
     ]);
     const existing = await client.query(
-      "SELECT id,input_hash FROM jobs WHERE user_id=$1 AND idempotency_key=$2",
+      "SELECT job_id AS id,input_hash FROM job_requests WHERE user_id=$1 AND idempotency_key=$2",
       [userId, input.idempotency_key],
     );
     if (existing.rows[0]) {
@@ -97,26 +82,49 @@ export async function createJob(userId: string, raw: unknown) {
         );
       return { id: existing.rows[0].id as string, reused: true };
     }
+    // A browser request key is not the identity of the recording being processed.
+    // Serialize on the owned note before reserving quota, then reuse its original
+    // task regardless of whether it is pending, failed or already completed.
+    let noteId = input.note_id ?? null;
+    if (input.kind === "chat" && noteId)
+      throw new AppError(400, "INVALID_NOTE_LINK", "问答请求不能指定便签。");
+    if (input.kind === "note" && noteId) {
+      const n = await client.query(
+        "SELECT status FROM notes WHERE id=$1 AND user_id=$2 FOR UPDATE",
+        [noteId, userId],
+      );
+      if (!n.rows[0]) throw new AppError(404, "NOTE_NOT_FOUND", "便签不存在。");
+      const original = await client.query<{ id: string; input: string }>(
+        "SELECT id,input FROM jobs WHERE user_id=$1 AND note_id=$2 AND kind='note' ORDER BY created_at,id LIMIT 1",
+        [userId, noteId],
+      );
+      if (original.rows[0]) {
+        if (original.rows[0].input !== input.input)
+          throw new AppError(
+            409,
+            "NOTE_INPUT_CONFLICT",
+            "此便签已开始处理，修改内容请新建便签；原任务可继续重试。",
+          );
+        await client.query(
+          "INSERT INTO job_requests(user_id,idempotency_key,input_hash,job_id) VALUES($1,$2,$3,$4)",
+          [userId, input.idempotency_key, hash, original.rows[0].id],
+        );
+        return { id: original.rows[0].id, reused: true };
+      }
+      if (n.rows[0].status !== "draft" && n.rows[0].status !== "failed")
+        throw new AppError(
+          409,
+          "NOTE_ALREADY_PROCESSED",
+          "此便签已提交处理，请查看原任务。",
+        );
+    }
     const d = await client.query<{ day: string }>(
       `SELECT to_char(now() AT TIME ZONE '${timeZone}','YYYY-MM-DD') AS day`,
     );
     const day = d.rows[0].day;
     await reserve(client, userId, day);
-    let noteId = input.note_id ?? null;
     if (input.kind === "note") {
       if (noteId) {
-        const n = await client.query(
-          "SELECT status FROM notes WHERE id=$1 AND user_id=$2 FOR UPDATE",
-          [noteId, userId],
-        );
-        if (!n.rows[0])
-          throw new AppError(404, "NOTE_NOT_FOUND", "便签不存在。");
-        if (n.rows[0].status !== "draft" && n.rows[0].status !== "failed")
-          throw new AppError(
-            409,
-            "NOTE_ALREADY_PROCESSED",
-            "此便签已提交处理，请查看原任务。",
-          );
         await client.query(
           "UPDATE notes SET transcript=$1,status='processing',updated_at=now() WHERE id=$2",
           [input.input, noteId],
@@ -128,10 +136,9 @@ export async function createJob(userId: string, raw: unknown) {
         );
         noteId = n.rows[0].id;
       }
-    } else if (noteId)
-      throw new AppError(400, "INVALID_NOTE_LINK", "问答请求不能指定便签。");
+    }
     const j = await client.query<{ id: string }>(
-      "INSERT INTO jobs(user_id,idempotency_key,input_hash,kind,input,note_id,quota_day,conversation_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",
+      "INSERT INTO jobs(user_id,idempotency_key,input_hash,kind,input,note_id,quota_day,conversation_id,business_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id",
       [
         userId,
         input.idempotency_key,
@@ -141,7 +148,12 @@ export async function createJob(userId: string, raw: unknown) {
         noteId,
         day,
         input.conversation_id ?? null,
+        input.kind === "note" ? `note:${noteId}` : null,
       ],
+    );
+    await client.query(
+      "INSERT INTO job_requests(user_id,idempotency_key,input_hash,job_id) VALUES($1,$2,$3,$4)",
+      [userId, input.idempotency_key, hash, j.rows[0].id],
     );
     await event(client, j.rows[0].id, "accepted", {
       kind: input.kind,
@@ -152,16 +164,22 @@ export async function createJob(userId: string, raw: unknown) {
   });
 }
 export async function getJob(userId: string, id: string): Promise<PublicJob> {
-  const r = await query<DbJob>(
-    "SELECT * FROM jobs WHERE id=$1 AND user_id=$2",
-    [id, userId],
-  );
-  const row = r.rows[0];
+  const [row] = await orm()
+    .select()
+    .from(jobs)
+    .where(and(eq(jobs.id, id), eq(jobs.user_id, userId)));
   if (!row) throw new AppError(404, "JOB_NOT_FOUND", "任务不存在。");
-  const e = await query(
-    "SELECT id::text,type,payload,created_at FROM job_events WHERE job_id=$1 ORDER BY id LIMIT 200",
-    [id],
-  );
+  const events = await orm()
+    .select({
+      id: jobEvents.id,
+      type: jobEvents.type,
+      payload: jobEvents.payload,
+      created_at: jobEvents.created_at,
+    })
+    .from(jobEvents)
+    .where(eq(jobEvents.job_id, id))
+    .orderBy(asc(jobEvents.id))
+    .limit(200);
   return {
     id: row.id,
     kind: row.kind,
@@ -174,11 +192,36 @@ export async function getJob(userId: string, id: string): Promise<PublicJob> {
     error: row.error,
     created_at: row.created_at.toISOString(),
     lease_until: row.lease_until?.toISOString() ?? null,
-    events: e.rows.map((v) => ({
+    events: events.map((v) => ({
       ...v,
+      id: v.id.toString(),
       created_at: v.created_at.toISOString(),
-    })) as PublicJob["events"],
+    })),
   };
+}
+export async function listConversationJobs(
+  userId: string,
+  conversationId: string,
+) {
+  const rows = await orm()
+    .select({ id: jobs.id })
+    .from(jobs)
+    .where(
+      and(
+        eq(jobs.user_id, userId),
+        eq(jobs.conversation_id, conversationId),
+        or(
+          eq(jobs.kind, "chat"),
+          and(
+            eq(jobs.kind, "note"),
+            sql`${jobs.result}->>'needs_clarification' = 'true'`,
+          ),
+        ),
+      ),
+    )
+    .orderBy(desc(jobs.created_at))
+    .limit(20);
+  return Promise.all(rows.reverse().map((row) => getJob(userId, row.id)));
 }
 export async function claimJob(
   userId: string,
@@ -286,6 +329,15 @@ export async function failJob(job: DbJob, error: unknown) {
       );
     const message =
       error instanceof AppError ? error.message : "处理失败，请稍后重试。";
+    const retryable =
+      error instanceof AppError &&
+      error.status >= 500 &&
+      ![
+        "MODEL_NOT_CONFIGURED",
+        "DATABASE_NOT_CONFIGURED",
+        "ASR_NOT_CONFIGURED",
+        "MODEL_REQUEST_REJECTED",
+      ].includes(error.code);
     await c.query(
       "UPDATE jobs SET status='failed',error=$1,quota_state=$2,lease_until=NULL,updated_at=now() WHERE id=$3",
       [message, refund ? "refunded" : "consumed", job.id],
@@ -295,6 +347,11 @@ export async function failJob(job: DbJob, error: unknown) {
         "UPDATE notes SET status='failed',updated_at=now() WHERE id=$1",
         [owned.rows[0].note_id],
       );
-    await event(c, job.id, "failed", { message, refunded: refund });
+    await event(c, job.id, "failed", {
+      message,
+      refunded: refund,
+      code: error instanceof AppError ? error.code : "PROCESSING_FAILED",
+      retryable,
+    });
   });
 }

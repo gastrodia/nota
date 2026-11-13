@@ -1,6 +1,10 @@
 import { Pool, type PoolClient, type QueryResultRow } from "pg";
+import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { AppError } from "./errors";
+import * as schema from "./schema";
 let pool: Pool | undefined;
+type OrmDatabase = NodePgDatabase<typeof schema>;
+let ormDatabase: OrmDatabase | undefined;
 export function database() {
   if (!process.env.DATABASE_URL)
     throw new AppError(503, "DATABASE_NOT_CONFIGURED", "数据库尚未配置。");
@@ -11,6 +15,13 @@ export function database() {
     connectionTimeoutMillis: 10000,
     allowExitOnIdle: true,
   }));
+}
+export function orm(): OrmDatabase {
+  return (ormDatabase ??= drizzle({ client: database(), schema }));
+}
+// Bind ORM queries to the same checked-out connection and transaction as raw SQL.
+export function ormTransaction<T>(fn: (db: OrmDatabase) => Promise<T>) {
+  return transaction((client) => fn(drizzle({ client, schema })));
 }
 export async function query<T extends QueryResultRow = QueryResultRow>(
   sql: string,
@@ -38,12 +49,15 @@ export async function transaction<T>(
 export async function closeDatabase() {
   await pool?.end();
   pool = undefined;
+  ormDatabase = undefined;
 }
 export function isUniqueError(error: unknown) {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    error.code === "23505"
-  );
+  // Drizzle wraps driver errors and preserves the PostgreSQL error as cause.
+  const seen = new Set<unknown>();
+  while (typeof error === "object" && error !== null && !seen.has(error)) {
+    if ("code" in error && error.code === "23505") return true;
+    seen.add(error);
+    error = "cause" in error ? error.cause : undefined;
+  }
+  return false;
 }

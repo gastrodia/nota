@@ -11,8 +11,9 @@ import {
   destroySession,
   throttle,
 } from "@/server/auth";
-import { quota, createJob, getJob } from "@/server/jobs";
+import { quota, createJob, getJob, listConversationJobs } from "@/server/jobs";
 import { runJob } from "@/server/agent";
+import { dispatchJob } from "@/server/worker";
 import {
   listNotes,
   getNote,
@@ -27,7 +28,6 @@ import {
   cleanupAudio,
   audioConfigured,
 } from "@/server/audio";
-import { query } from "@/server/db";
 export const maxDuration = 240;
 async function json(request: Request) {
   try {
@@ -166,6 +166,7 @@ async function route(request: Request) {
     });
   if (path === "jobs" && method === "POST") {
     const created = await createJob(user.id, await json(request));
+    dispatchJob(user.id, created.id);
     return Response.json(
       { job: await getJob(user.id, created.id), reused: created.reused },
       { status: created.reused ? 200 : 201 },
@@ -176,15 +177,9 @@ async function route(request: Request) {
       .string()
       .uuid()
       .parse(url.searchParams.get("conversation_id"));
-    const r = await query(
-      "SELECT id FROM jobs WHERE user_id=$1 AND conversation_id=$2 AND kind='chat' ORDER BY created_at DESC LIMIT 20",
-      [user.id, conversation],
-    );
     return Response.json(
       {
-        jobs: await Promise.all(
-          r.rows.reverse().map((row) => getJob(user.id, row.id)),
-        ),
+        jobs: await listConversationJobs(user.id, conversation),
       },
       { headers: { "Cache-Control": "no-store" } },
     );

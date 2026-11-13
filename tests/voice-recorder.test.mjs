@@ -6,6 +6,7 @@ import { join } from "node:path";
 import ts from "typescript";
 import { JSDOM } from "jsdom";
 import React, { act } from "react";
+import { IDBFactory } from "fake-indexeddb";
 import { createRoot } from "react-dom/client";
 
 const project = fileURLToPath(new URL("../", import.meta.url));
@@ -23,9 +24,12 @@ const compiled = ts.transpileModule(source, {
 const hookPath = join(buildDir, "use-voice-recorder.mjs");
 await writeFile(
   hookPath,
-  compiled.outputText.replaceAll('"../lib/asr-client"', '"./asr-client.mjs"'),
+  compiled.outputText
+    .replaceAll('"../lib/asr-client"', '"./asr-client.mjs"')
+    .replaceAll('"../lib/audio-draft"', '"./audio-draft.mjs"')
+    .replaceAll('"../lib/recorded-asr"', '"./recorded-asr.mjs"'),
 );
-for (const name of ["asr-client", "api"]) {
+for (const name of ["asr-client", "api", "audio-draft", "recorded-asr"]) {
   await writeFile(
     join(buildDir, `${name}.mjs`),
     ts.transpileModule(
@@ -85,7 +89,7 @@ test.after(async () => {
   await rm(buildDir, { recursive: true });
 });
 
-async function harness(t, getMedia, App) {
+async function harness(t, getMedia, App, hookOptions = {}) {
   const dom = new JSDOM(
     '<!doctype html><html><body><div id="app"></div></body></html>',
     { url: "http://localhost" },
@@ -138,6 +142,7 @@ async function harness(t, getMedia, App) {
     }),
   );
   install("MediaRecorder", Recorder);
+  install("indexedDB", new IDBFactory());
   install("IS_REACT_ACT_ENVIRONMENT", true);
   dom.window.HTMLDialogElement.prototype.showModal = function () {
     this.setAttribute("open", "");
@@ -156,10 +161,10 @@ async function harness(t, getMedia, App) {
   URL.revokeObjectURL = (url) => revoked.push(url);
   let current;
   function Harness() {
-    current = useVoiceRecorder();
+    current = useVoiceRecorder(hookOptions);
     return React.createElement("output", null, current.status);
   }
-  const root = createRoot(dom.window.document.getElementById("app"));
+  let root = createRoot(dom.window.document.getElementById("app"));
   let unmounted = false;
   async function unmount() {
     if (!unmounted) {
@@ -178,14 +183,30 @@ async function harness(t, getMedia, App) {
     }
   });
   await act(async () => root.render(React.createElement(App ?? Harness)));
+  await act(async () => new Promise((resolve) => setTimeout(resolve, 20)));
   return {
+    async settle() {
+      await act(async () => new Promise((resolve) => setTimeout(resolve, 30)));
+    },
     get current() {
       return current;
     },
     created,
     revoked,
     recorders,
+    install,
     unmount,
+    async remount(options = hookOptions) {
+      await unmount();
+      hookOptions = options;
+      root = createRoot(dom.window.document.getElementById("app"));
+      unmounted = false;
+      await act(async () => {
+        root.render(React.createElement(App ?? Harness));
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      });
+      await act(async () => new Promise((resolve) => setTimeout(resolve, 20)));
+    },
     container: dom.window.document.getElementById("app"),
   };
 }
@@ -206,12 +227,14 @@ test("stop preserves final audio, releases microphone and revokes a discarded pr
   await act(async () => h.current.start());
   assert.equal(h.current.status, "recording");
   await act(async () => h.current.stop());
+  await h.settle();
   assert.equal(h.current.status, "recorded");
   assert.ok(h.current.audioBlob.size > 0);
   assert.equal(h.current.audioBlob.type, "audio/webm;codecs=opus");
   assert.equal(stream.track.stopped, 1);
   const preview = h.current.audioUrl;
   await act(async () => h.current.stop());
+  await h.settle();
   assert.equal(h.created.length, 1);
   await act(async () => h.current.discard());
   assert.equal(h.current.audioUrl, "");
@@ -234,6 +257,7 @@ test("closing while permission is pending rejects a late stream without starting
   });
   assert.equal(h.current.status, "requesting");
   await act(async () => h.current.stop());
+  await h.settle();
   assert.equal(h.current.status, "idle");
   await act(async () => {
     allow(stream);
@@ -270,6 +294,7 @@ test("unmount revokes an existing preview URL", async (t) => {
   const h = await harness(t, async () => stream);
   await act(async () => h.current.start());
   await act(async () => h.current.stop());
+  await h.settle();
   const preview = h.current.audioUrl;
   await h.unmount();
   assert.deepEqual(h.revoked, [preview]);
@@ -310,4 +335,200 @@ test("mobile voice entry opens the sheet and starts capture; close releases it; 
     ),
     ["历史", "待办"],
   );
+});
+
+test("captured audio and edited transcript survive remount and are isolated by account", async (t) => {
+  const h = await harness(t, async () => mediaStream(), undefined, {
+    ownerId: "alice",
+  });
+  await act(async () => h.current.start());
+  await act(async () => h.current.stop());
+  await h.settle();
+  const capture = h.current.audioId;
+  await act(async () => h.current.saveTranscript("确认后的会议记录"));
+  await h.remount();
+  assert.equal(h.current.audioId, capture);
+  assert.equal(h.current.recovered, true);
+  assert.equal(h.current.transcript, "确认后的会议记录");
+  assert.equal(await h.current.audioBlob.text(), "test-audio");
+  await h.remount({ ownerId: "bob" });
+  assert.equal(h.current.audioBlob, null);
+  assert.equal(h.current.transcript, "");
+  await h.remount({ ownerId: "alice" });
+  assert.equal(h.current.audioId, capture);
+  await act(async () => h.current.markUploaded());
+  await h.remount();
+  assert.equal(h.current.audioBlob, null);
+});
+
+test("retry converts existing raw audio to PCM and keeps a recoverable original when ASR fails", async (t) => {
+  const h = await harness(t, async () => mediaStream(), undefined, {
+    ownerId: "alice",
+  });
+  await act(async () => h.current.start());
+  await act(async () => h.current.stop());
+  await h.settle();
+  const capture = h.current.audioId;
+  let submitted;
+  let closed = 0;
+  h.install(
+    "AudioContext",
+    class {
+      async decodeAudioData(bytes) {
+        assert.equal(new TextDecoder().decode(bytes), "test-audio");
+        return {
+          length: 4,
+          sampleRate: 16000,
+          numberOfChannels: 1,
+          getChannelData: () => Float32Array.from([0, 1, -1, 0.5]),
+        };
+      }
+      async close() {
+        closed++;
+      }
+    },
+  );
+  h.install("fetch", async (_url, options) => {
+    submitted = options.body;
+    return Response.json(
+      { error: { message: "上游暂时不可用" } },
+      { status: 502 },
+    );
+  });
+  await act(async () => h.current.retryTranscription());
+  assert.equal(submitted.byteLength, 8);
+  assert.equal(new DataView(submitted).getInt16(2, true), 32767);
+  assert.equal(h.current.asrStatus, "error");
+  assert.match(h.current.asrError, /上游/);
+  assert.equal(h.current.audioId, capture);
+  assert.equal(closed, 1);
+  await h.remount();
+  assert.equal(h.current.audioId, capture);
+  assert.equal(await h.current.audioBlob.text(), "test-audio");
+  h.install("fetch", async () => Response.json({ transcript: "重新识别成功" }));
+  await act(async () => h.current.retryTranscription());
+  assert.equal(h.current.transcript, "重新识别成功");
+  assert.equal(h.current.asrStatus, "complete");
+  await h.remount();
+  assert.equal(h.current.transcript, "重新识别成功");
+});
+
+test("denied rerecord preserves the previous bytes, capture identity and durable draft", async (t) => {
+  let denied = false;
+  const h = await harness(
+    t,
+    async () => {
+      if (denied) throw new DOMException("Denied", "NotAllowedError");
+      return mediaStream();
+    },
+    undefined,
+    { ownerId: "alice" },
+  );
+  await act(async () => h.current.start());
+  await act(async () => h.current.stop());
+  await h.settle();
+  const id = h.current.audioId;
+  const blob = h.current.audioBlob;
+  denied = true;
+  await act(async () => h.current.start());
+  assert.equal(h.current.audioId, id);
+  assert.equal(h.current.audioBlob, blob);
+  assert.equal(h.current.status, "recorded");
+  await h.remount();
+  assert.equal(h.current.audioId, id);
+});
+
+test("edits during a pending ASR retry survive completion and reload", async (t) => {
+  const h = await harness(t, async () => mediaStream(), undefined, {
+    ownerId: "alice",
+  });
+  await act(async () => h.current.start());
+  await act(async () => h.current.stop());
+  await h.settle();
+  h.install(
+    "AudioContext",
+    class {
+      async decodeAudioData() {
+        return {
+          length: 4,
+          sampleRate: 16000,
+          numberOfChannels: 1,
+          getChannelData: () => new Float32Array(4),
+        };
+      }
+      async close() {}
+    },
+  );
+  let finish;
+  h.install(
+    "fetch",
+    () =>
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+  );
+  let pending;
+  await act(async () => {
+    pending = h.current.retryTranscription();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  });
+  await act(async () => h.current.saveTranscript("用户修正为八万元"));
+  await act(async () => {
+    finish(Response.json({ transcript: "模型识别十八万元" }));
+    await pending;
+  });
+  await h.remount();
+  assert.equal(h.current.transcript, "用户修正为八万元");
+});
+
+test("a slow ASR connection does not delay local recording or durable original capture", async (t) => {
+  const h = await harness(t, async () => mediaStream(), undefined, {
+    ownerId: "alice",
+    asr: { realtime: true },
+  });
+  let releaseWorklet;
+  h.install(
+    "AudioContext",
+    class {
+      resume() {
+        return Promise.resolve();
+      }
+      audioWorklet = {
+        addModule: () =>
+          new Promise((resolve) => {
+            releaseWorklet = resolve;
+          }),
+      };
+      createMediaStreamSource() {
+        return { connect() {}, disconnect() {} };
+      }
+      createGain() {
+        return { gain: { value: 0 }, connect() {} };
+      }
+      async close() {}
+    },
+  );
+  h.install(
+    "AudioWorkletNode",
+    class {
+      port = { onmessage: null, postMessage() {} };
+      connect() {}
+      disconnect() {}
+    },
+  );
+  await act(async () => h.current.start());
+  assert.equal(h.current.status, "recording");
+  assert.equal(h.recorders[0].state, "recording");
+  assert.equal(h.current.asrStatus, "connecting");
+  await act(async () => {
+    releaseWorklet();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  });
+  await act(async () => h.current.stop());
+  await h.settle();
+  assert.equal(h.current.status, "recorded");
+  const id = h.current.audioId;
+  await h.remount({ ownerId: "alice" });
+  assert.equal(h.current.audioId, id);
+  assert.equal(await h.current.audioBlob.text(), "test-audio");
 });

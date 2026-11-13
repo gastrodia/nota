@@ -6,16 +6,16 @@
 
 ## 功能
 
-- **语音记录**：点击底部语音按钮开始录音，转写后可编辑确认，支持原始录音保存与回放。
+- **语音记录**：点击底部语音按钮开始录音，原音按账户保存在本机，刷新后可恢复并重新转写；支持无文字先保存云端原音和私有回放。
 - **AI 整理**：生成标题和摘要，根据明确指令创建待办。
-- **Agent 问答**：查询历史便签、创建待办，并展示工具调用过程和回答来源。
+- **Agent 问答**：查询历史便签、创建待办，遇到模糊时间或冲突证据先追问，并展示工具过程和回答来源。
 - **个人空间**：管理历史记录与待办，支持搜索、完成状态切换和来源追溯。
 - **账户与额度**：账户数据独立，每天提供 10 次 AI 处理额度，按北京时间零点更新。
 
 ## 技术栈
 
 - **应用**：Next.js App Router、React、TypeScript
-- **数据库**：Neon PostgreSQL
+- **数据库**：Neon PostgreSQL、Drizzle ORM（复用 `pg` 连接池）
 - **模型**：Qwen3.8-Flash、Qwen3-ASR-Flash-Realtime
 - **音频存储与部署**：Vercel Blob（Private）、Vercel
 
@@ -53,7 +53,33 @@ pnpm dev
 
 ## 架构说明
 
-Next.js 同时承载前端与 Node.js API。浏览器采集音频，服务端代理 Qwen ASR；Neon 保存账户、便签、待办和额度，私有 Blob 保存录音原件。Agent 通过 `create_todo`、`search_notes` 两个工具执行操作，再生成结构化结果和来源引用。历史检索采用账户内关键词与日期过滤。数据库事务、幂等键和任务租约用于保证额度准确、避免重试重复写入。
+Next.js 承载网页与 Node.js API；IndexedDB 保留本机原音，私有 Blob 保存云端原件，Neon 保存业务数据和任务。Agent 自主创建待办、检索历史或追问，按真实工具结果回答。历史检索使用录音时间、实体关键词和有限同义词，暂不引入向量库。事务预占额度，录音业务键和工具账本防重复；响应后执行与独立 Worker 恢复任务。首版只保存待办，不提供主动提醒。
+
+常规数据访问使用 Drizzle 的类型化查询；任务锁、额度扣减和工具检索等复杂逻辑保留参数化 SQL。表结构类型定义在 `src/server/schema.ts`，数据库变更继续通过 `db/migrations/*.sql` 和 `pnpm db:migrate` 管理，详细约定见[数据库访问](docs/database.md)。
+
+## 后台执行
+
+正常请求提交后会在服务端响应结束后开始处理。要保证用户离开页面、函数中断后仍自动恢复，生产需另外运行独立进程：
+
+```bash
+pnpm worker
+# 单次排空一批（最多两个并行任务）
+pnpm worker:once
+```
+
+Worker 每五秒扫描数据库，恢复待执行/过期租约任务；可重试错误按 15–300 秒退避，最多五次。权限或参数配置错误停止自动重试。它使用相同数据库和模型配置，建议由进程管理器保持运行。
+
+Vercel 环境可以由外部调度器周期调用 `GET /api/internal/worker`，请求头为 `Authorization: Bearer <CRON_SECRET>`。在调度器和服务端配置同一个随机密钥；单次最多执行两个任务并清理音频删除队列。本仓库不默认启用任何付费调度，部署时必须实际配置调度器或持久 Worker；仅设置密钥不会启动调度。
+
+## 效果评估
+
+```bash
+# 真实模型 + 独立本地 nota_test 数据库，使用合成数据
+TEST_DATABASE_URL=postgresql://nota_test:nota_local_test_only@127.0.0.1:55437/nota_test pnpm eval:live --label candidate --output work/candidate.json
+pnpm eval:compare work/baseline.json work/candidate.json
+```
+
+评估保存数据集、提示词/代码指纹、模型请求和回答及耗时，对比关键事实、实际待办和来源支持。报告包含合成原文，请按评估资料管理；不会记录请求认证头。固定样本通过不代表开放场景准确率。可用参数包括 `--label`、`--output` 和 `--baseline`。
 
 ## 本地检查
 
@@ -75,6 +101,8 @@ pnpm test:local
 ## 文档
 
 - [设计与实现](docs/design-decisions.md)
+- [数据库访问](docs/database.md)
+- [Part A 对齐与实现边界](docs/part-a-alignment.md)
 - [音频链路与存储](docs/audio-recording.md)
 - [测试与验证](docs/verification.md)
 - [演示流程](docs/demo-script.md)

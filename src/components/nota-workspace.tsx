@@ -107,7 +107,6 @@ export function NotaWorkspace() {
   const [editedDraft, setEditedDraft] = useState<string | null>(null);
   const [draftNotice, setDraftNotice] = useState("");
   const manualEdit = useRef(false);
-  const captureId = useRef("");
   const [voiceNoteId, setVoiceNoteId] = useState<string | null>(null);
   const [authMode, setAuthMode] = useState<"login" | "register">("login");
   const [email, setEmail] = useState("");
@@ -135,6 +134,7 @@ export function NotaWorkspace() {
   );
   const draft = editedDraft ?? storedDraft;
   const recorder = useVoiceRecorder({
+    ownerId: user?.id,
     asr:
       user && config.asr
         ? {
@@ -167,7 +167,7 @@ export function NotaWorkspace() {
   }
   function mergeJob(job: PublicJob) {
     setActiveJob(job);
-    if (job.kind === "chat")
+    if (job.kind === "chat" || job.result?.needs_clarification)
       setJobs((previous) =>
         [...previous.filter((j) => j.id !== job.id), job].sort((a, b) =>
           a.created_at.localeCompare(b.created_at),
@@ -213,6 +213,13 @@ export function NotaWorkspace() {
         if (current.status === "succeeded") {
           clearOperation(owner.id, current.kind);
           await refresh(owner);
+          if (current.kind === "note" && current.note_id === recorder.audioId)
+            await recorder.markUploaded();
+          if (current.result?.needs_clarification) {
+            voiceDialog.current?.close();
+            setScreen("agent");
+            return;
+          }
           if (
             current.kind === "note" &&
             voiceDialog.current?.open &&
@@ -350,6 +357,9 @@ export function NotaWorkspace() {
       );
       ownerRef.current = result.user;
       setUser(result.user);
+      manualEdit.current = false;
+      setEditedDraft(null);
+      setVoiceNoteId(null);
       setUsage(result.quota);
       conversationId.current = conversation(result.user.id);
       setJobs([]);
@@ -367,7 +377,7 @@ export function NotaWorkspace() {
     try {
       await api("auth/logout", { method: "POST" });
       watcher.current?.abort();
-      recorder.discard();
+      recorder.discard(false);
       setVoiceNoteId(null);
       voiceDialog.current?.close();
       sourceDialog.current?.close();
@@ -405,18 +415,28 @@ export function NotaWorkspace() {
     }
   }
   function startRecording() {
-    captureId.current = crypto.randomUUID();
+    if (
+      recorder.audioBlob &&
+      !window.confirm("重新录制会替换本机尚未整理的录音，继续吗？")
+    )
+      return;
     manualEdit.current = false;
-    setEditedDraft("");
     setDraftNotice("");
-    setVoiceNoteId(null);
-    void recorder.start();
+    void recorder.start().then((started) => {
+      if (started) {
+        setEditedDraft("");
+        setVoiceNoteId(null);
+      }
+    });
   }
   function openVoice() {
     if (voiceDialog.current?.open) return;
     setVoiceMode("audio");
     voiceDialog.current?.showModal();
-    if (recorder.status === "idle" || recorder.status === "error")
+    if (
+      !recorder.recovering &&
+      (recorder.status === "idle" || recorder.status === "error")
+    )
       startRecording();
   }
   function closeVoice() {
@@ -437,10 +457,69 @@ export function NotaWorkspace() {
     }
     try {
       localStorage.setItem(draftKey, draft.trim());
+      recorder.saveTranscript(draft.trim());
       window.dispatchEvent(new Event("nota:draft"));
       setDraftNotice("文字草稿已保存到当前浏览器。");
     } catch {
       setDraftNotice("浏览器无法保存，请先复制文字保留。");
+    }
+  }
+  function removeDraft() {
+    if (busy || waiting || recording) return;
+    if (!window.confirm("删除当前浏览器中的文字草稿？")) return;
+    try {
+      localStorage.removeItem(draftKey);
+      manualEdit.current = true;
+      setEditedDraft(null);
+      window.dispatchEvent(new Event("nota:draft"));
+      setDraftNotice("本机文字草稿已删除。");
+    } catch {
+      const error = "浏览器无法删除草稿，请稍后重试。";
+      setDraftNotice(error);
+      setNotice(error);
+    }
+  }
+  async function saveOriginalAudio(input = draft) {
+    const owner = ownerRef.current;
+    if (!owner) {
+      openAuth();
+      return null;
+    }
+    if (!recorder.audioBlob) return null;
+    if (!config.audio_storage)
+      throw new Error("私有音频存储尚未配置，原音保留在本机，请先下载备份。");
+    const noteId = voiceNoteId ?? recorder.audioId;
+    await api<{ note: Note }>("notes", {
+      method: "POST",
+      body: JSON.stringify({
+        id: noteId,
+        source: "voice",
+        transcript: input.trim(),
+        duration_seconds: Math.min(60, recorder.duration),
+        recorded_at: recorder.recordedAt,
+      }),
+    });
+    const existing = (await api<{ note: NoteDetail }>(`notes/${noteId}`)).note;
+    if (!existing.has_audio) {
+      const form = new FormData();
+      form.set("audio", recorder.audioBlob, "recording");
+      await api(`notes/${noteId}/audio`, { method: "POST", body: form });
+    }
+    if (ownerRef.current?.id !== owner.id) return null;
+    setVoiceNoteId(noteId);
+    await refresh(owner);
+    return noteId;
+  }
+  async function saveOriginalOnly() {
+    setBusy(true);
+    try {
+      const saved = await saveOriginalAudio();
+      if (saved)
+        setDraftNotice("原始录音已私有保存到云端，可稍后继续转写和整理。");
+    } catch (error) {
+      setDraftNotice(message(error));
+    } finally {
+      setBusy(false);
     }
   }
   async function submitJob(
@@ -479,11 +558,11 @@ export function NotaWorkspace() {
       }
       const fingerprint = JSON.stringify({
         input: input.trim(),
-        conversation: kind === "chat" ? conversationId.current : null,
+        conversation: conversationId.current,
         audio:
           kind === "note" && includeAudio && recorder.audioBlob
             ? {
-                capture: captureId.current,
+                capture: recorder.audioId,
                 size: recorder.audioBlob.size,
                 type: recorder.audioBlob.type,
               }
@@ -492,37 +571,11 @@ export function NotaWorkspace() {
       const op = pendingOperation(owner.id, kind, fingerprint);
       if (kind === "note" && voiceNoteId) op.note_id = voiceNoteId;
       if (kind === "note" && includeAudio && recorder.audioBlob) {
-        if (!op.note_id) {
-          op.note_id = crypto.randomUUID();
-          saveOperation(owner.id, kind, op);
-        }
-        if (!op.audio_uploaded) {
-          await api<{ note: Note }>("notes", {
-            method: "POST",
-            body: JSON.stringify({
-              id: op.note_id,
-              source: "voice",
-              transcript: input.trim(),
-              duration_seconds: Math.min(60, recorder.duration),
-            }),
-          });
-        }
-        setVoiceNoteId(op.note_id);
-        if (!op.audio_uploaded) {
-          const existing = (
-            await api<{ note: NoteDetail }>(`notes/${op.note_id}`)
-          ).note;
-          if (!existing.has_audio) {
-            const form = new FormData();
-            form.set("audio", recorder.audioBlob, "recording");
-            await api(`notes/${op.note_id}/audio`, {
-              method: "POST",
-              body: form,
-            });
-          }
-          op.audio_uploaded = true;
-          saveOperation(owner.id, kind, op);
-        }
+        const saved = await saveOriginalAudio(input);
+        if (!saved) return;
+        op.note_id = saved;
+        op.audio_uploaded = true;
+        saveOperation(owner.id, kind, op);
       }
       if (!op.job_id) {
         const result = await api<{ job: PublicJob }>("jobs", {
@@ -531,9 +584,7 @@ export function NotaWorkspace() {
             kind,
             input: input.trim(),
             idempotency_key: op.idempotency_key,
-            ...(kind === "chat"
-              ? { conversation_id: conversationId.current }
-              : {}),
+            conversation_id: conversationId.current,
             ...(op.note_id ? { note_id: op.note_id } : {}),
           }),
         });
@@ -706,11 +757,6 @@ export function NotaWorkspace() {
                 ＋
               </button>
             </div>
-            {notice && (
-              <p className="app-notice" role="status">
-                {notice}
-              </p>
-            )}
             {user && jobs.length > 0 ? (
               jobs.map(renderJob)
             ) : !example ? (
@@ -823,6 +869,11 @@ export function NotaWorkspace() {
             <div ref={chatEnd} />
           </main>
           <form className="chat-composer" onSubmit={sendQuestion}>
+            {notice && (
+              <p className="app-notice composer-notice" role="status">
+                {notice}
+              </p>
+            )}
             <div className="composer-field">
               <label htmlFor="agent-question" className="sr-only">
                 向 Agent 提问
@@ -931,12 +982,30 @@ export function NotaWorkspace() {
                   placeholder="搜索记录内容…"
                 />
               </label>
+              {recorder.audioBlob && (
+                <div className="draft-card">
+                  <button className="draft-open" onClick={openVoice}>
+                    <span>本机录音 · 可继续</span>
+                    <p>{recorder.transcript || "原音已保留，可重新转写"}</p>
+                    <small>{clock(recorder.duration)} · 继续 ↗</small>
+                  </button>
+                </div>
+              )}
               {storedDraft && (
-                <button className="draft-card" onClick={openText}>
-                  <span>本机草稿 · 未处理</span>
-                  <p>{storedDraft}</p>
-                  <small>继续编辑 ↗</small>
-                </button>
+                <div className="draft-card">
+                  <button className="draft-open" onClick={openText}>
+                    <span>本机草稿 · 未处理</span>
+                    <p>{storedDraft}</p>
+                    <small>继续编辑 ↗</small>
+                  </button>
+                  <button
+                    className="draft-delete"
+                    disabled={busy || waiting || recording}
+                    onClick={removeDraft}
+                  >
+                    删除草稿
+                  </button>
+                </div>
               )}
               <div className="list-caption">
                 <span>{user ? "历史记录" : "历史记录示例"}</span>
@@ -1182,15 +1251,17 @@ export function NotaWorkspace() {
                   <i />
                   {recording
                     ? "正在录音"
-                    : recorder.asrStatus === "connecting"
-                      ? "连接语音识别中"
-                      : recorder.status === "requesting"
-                        ? "正在请求麦克风权限"
-                        : recorder.status === "finishing"
-                          ? "正在完成录音与转写"
-                          : recorder.status === "recorded"
-                            ? "录音已完成"
-                            : "准备录音"}
+                    : recorder.recovering
+                      ? "正在恢复本机录音"
+                      : recorder.asrStatus === "connecting"
+                        ? "连接语音识别中"
+                        : recorder.status === "requesting"
+                          ? "正在请求麦克风权限"
+                          : recorder.status === "finishing"
+                            ? "正在完成录音与转写"
+                            : recorder.status === "recorded"
+                              ? "录音已完成"
+                              : "准备录音"}
                 </div>
                 <div className="recording-clock">
                   {clock(recorder.duration)}
@@ -1213,7 +1284,9 @@ export function NotaWorkspace() {
                     {recorder.error}
                   </p>
                 )}
-                {recorder.audioUrl && recorder.status === "recorded" ? (
+                {recorder.audioUrl &&
+                (recorder.status === "recorded" ||
+                  recorder.status === "finishing") ? (
                   <div className="audio-review">
                     <audio
                       controls
@@ -1222,9 +1295,8 @@ export function NotaWorkspace() {
                     />
                     <div>
                       <button
-                        disabled={busy}
+                        disabled={busy || waiting}
                         onClick={() => {
-                          recorder.discard();
                           startRecording();
                         }}
                       >
@@ -1241,7 +1313,7 @@ export function NotaWorkspace() {
                 ) : (
                   <button
                     className={`record-control ${recording ? "stop-control" : ""}`}
-                    disabled={waiting || busy}
+                    disabled={waiting || busy || recorder.recovering}
                     aria-label={
                       recording
                         ? "停止录音"
@@ -1296,10 +1368,49 @@ export function NotaWorkspace() {
                           : "转写完成后可编辑文字，再确认整理。")}
                 </p>
               </div>
-              {recorder.status === "recorded" && (
-                <button className="wide-button" onClick={openText}>
-                  确认文字并整理 →
-                </button>
+              {recorder.audioBlob && !recording && (
+                <>
+                  {recorder.recovered && (
+                    <p className="text-draft-help">
+                      已恢复本机录音，可试听、重新转写或继续整理。
+                    </p>
+                  )}
+                  <p className="text-draft-help" role="status">
+                    {recorder.durabilityError ||
+                      "原音已暂存本机，刷新后可继续；清理浏览器数据会删除本机副本。"}
+                  </p>
+                  <div className="voice-text-actions">
+                    <button
+                      className="draft-save"
+                      disabled={busy || waiting || !user || !config.asr}
+                      onClick={() => {
+                        manualEdit.current = false;
+                        void recorder.retryTranscription();
+                      }}
+                    >
+                      重新转写原音
+                    </button>
+                    <button
+                      className="draft-save"
+                      disabled={busy || !user}
+                      onClick={() => void saveOriginalOnly()}
+                    >
+                      保存原音到云端
+                    </button>
+                  </div>
+                  <button
+                    className="wide-button"
+                    disabled={waiting}
+                    onClick={openText}
+                  >
+                    确认文字并整理 →
+                  </button>
+                  {draftNotice && (
+                    <p className="draft-notice" role="status">
+                      {draftNotice}
+                    </p>
+                  )}
+                </>
               )}
               <button className="switch-to-text" onClick={openText}>
                 也可以改用文字记录 →
@@ -1314,6 +1425,7 @@ export function NotaWorkspace() {
                 onChange={(e) => {
                   manualEdit.current = true;
                   setEditedDraft(e.target.value);
+                  recorder.saveTranscript(e.target.value);
                   setDraftNotice("");
                 }}
                 maxLength={10000}
@@ -1349,6 +1461,15 @@ export function NotaWorkspace() {
               <p className="draft-notice" role="status">
                 {draftNotice}
               </p>
+              {storedDraft && (
+                <button
+                  className="draft-delete"
+                  disabled={busy || waiting || recording}
+                  onClick={removeDraft}
+                >
+                  删除本机草稿
+                </button>
+              )}
               {voiceNoteId && (
                 <p className="text-draft-help">
                   云端草稿已建立，失败后重试会沿用原记录。
@@ -1402,7 +1523,7 @@ export function NotaWorkspace() {
           <h2 id="note-title">{note.title}</h2>
           <p className="detail-meta">
             {noteIsReal
-              ? date((note as Note).created_at)
+              ? date((note as Note).recorded_at ?? (note as Note).created_at)
               : (note as DemoNote).time}
           </p>
           {noteIsReal && (note as Note).has_audio && (
@@ -1444,15 +1565,40 @@ export function NotaWorkspace() {
             <button
               className="wide-button"
               onClick={() => {
-                recorder.discard();
+                const saved = note as Note;
+                if (
+                  recorder.audioBlob &&
+                  recorder.audioId !== saved.id &&
+                  !window.confirm(
+                    "打开这条云端录音会替换当前本机录音，继续吗？",
+                  )
+                )
+                  return;
+                recorder.discard(false);
                 if (user) clearOperation(user.id, "note");
                 manualEdit.current = true;
-                setEditedDraft(note.transcript);
-                setVoiceNoteId(note.id);
+                setEditedDraft(saved.transcript);
+                setVoiceNoteId(saved.id);
                 sourceDialog.current?.close();
-                setVoiceMode("text");
+                setVoiceMode(saved.has_audio ? "audio" : "text");
                 setDraftNotice("已恢复云端草稿，已保存的原始录音会保留。");
                 voiceDialog.current?.showModal();
+                if (saved.has_audio) {
+                  void fetch(`/api/notes/${saved.id}/audio`)
+                    .then(async (response) => {
+                      if (!response.ok)
+                        throw new Error("云端原音读取失败，请稍后重试。");
+                      const blob = await response.blob();
+                      if (!user || ownerRef.current?.id !== user.id) return;
+                      await recorder.restoreAudio(blob, {
+                        id: saved.id,
+                        transcript: saved.transcript,
+                        recorded_at: saved.recorded_at ?? saved.created_at,
+                        duration_seconds: saved.duration_seconds ?? 0,
+                      });
+                    })
+                    .catch((error) => setDraftNotice(message(error)));
+                }
               }}
             >
               继续整理此便签

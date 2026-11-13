@@ -5,7 +5,9 @@ import {
   createHash,
 } from "node:crypto";
 import { promisify } from "node:util";
-import { query, isUniqueError } from "./db";
+import { and, eq, gt, sql } from "drizzle-orm";
+import { orm, isUniqueError } from "./db";
+import { authBuckets, sessions, users } from "./schema";
 import { AppError } from "./errors";
 import type { User } from "../lib/contracts";
 const scrypt = promisify(scryptCallback);
@@ -26,22 +28,26 @@ export async function verifyPassword(password: string, stored: string) {
 }
 export async function throttle(key: string, limit: number, seconds = 900) {
   const bucket = Math.floor(Date.now() / 1000 / seconds);
-  const r = await query<{ count: number }>(
-    "INSERT INTO auth_buckets(key,bucket) VALUES($1,$2) ON CONFLICT(key,bucket) DO UPDATE SET count=auth_buckets.count+1 RETURNING count",
-    [sha256(key), bucket],
-  );
-  if (r.rows[0].count > limit)
+  const [row] = await orm()
+    .insert(authBuckets)
+    .values({ key: sha256(key), bucket })
+    .onConflictDoUpdate({
+      target: [authBuckets.key, authBuckets.bucket],
+      set: { count: sql`${authBuckets.count} + 1` },
+    })
+    .returning({ count: authBuckets.count });
+  if (row.count > limit)
     throw new AppError(429, "AUTH_RATE_LIMIT", "尝试过于频繁，请稍后重试。");
 }
 export async function register(email: string, password: string): Promise<User> {
   await throttle(`register:${email}`, 5);
   const hash = await hashPassword(password);
   try {
-    const r = await query<User>(
-      "INSERT INTO users(email,password_hash) VALUES($1,$2) RETURNING id,email",
-      [email, hash],
-    );
-    return r.rows[0];
+    const [user] = await orm()
+      .insert(users)
+      .values({ email, password_hash: hash })
+      .returning({ id: users.id, email: users.email });
+    return user;
   } catch (e) {
     if (isUniqueError(e))
       throw new AppError(409, "EMAIL_EXISTS", "此邮箱已注册，请直接登录。");
@@ -50,11 +56,14 @@ export async function register(email: string, password: string): Promise<User> {
 }
 export async function login(email: string, password: string): Promise<User> {
   await throttle(`login:${email}`, 10);
-  const r = await query<User & { password_hash: string }>(
-    "SELECT id,email,password_hash FROM users WHERE email=$1",
-    [email],
-  );
-  const row = r.rows[0];
+  const [row] = await orm()
+    .select({
+      id: users.id,
+      email: users.email,
+      password_hash: users.password_hash,
+    })
+    .from(users)
+    .where(eq(users.email, email));
   const hash =
     row?.password_hash ??
     "scrypt:invalid-fixed-salt:00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000";
@@ -65,10 +74,13 @@ export async function login(email: string, password: string): Promise<User> {
 }
 export async function createSession(userId: string) {
   const token = randomBytes(32).toString("base64url");
-  await query(
-    "INSERT INTO sessions(token_hash,user_id,expires_at) VALUES($1,$2,now()+interval '14 days')",
-    [sha256(token), userId],
-  );
+  await orm()
+    .insert(sessions)
+    .values({
+      token_hash: sha256(token),
+      user_id: userId,
+      expires_at: sql`now() + interval '14 days'`,
+    });
   return token;
 }
 export function readToken(request: Request) {
@@ -83,11 +95,17 @@ export function readToken(request: Request) {
 export async function currentUser(request: Request): Promise<User | null> {
   const token = readToken(request);
   if (!token) return null;
-  const r = await query<User>(
-    "SELECT u.id,u.email FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=$1 AND s.expires_at>now()",
-    [sha256(token)],
-  );
-  return r.rows[0] ?? null;
+  const [user] = await orm()
+    .select({ id: users.id, email: users.email })
+    .from(sessions)
+    .innerJoin(users, eq(users.id, sessions.user_id))
+    .where(
+      and(
+        eq(sessions.token_hash, sha256(token)),
+        gt(sessions.expires_at, sql`now()`),
+      ),
+    );
+  return user ?? null;
 }
 export async function requireUser(request: Request) {
   const user = await currentUser(request);
@@ -97,7 +115,9 @@ export async function requireUser(request: Request) {
 export async function destroySession(request: Request) {
   const token = readToken(request);
   if (token)
-    await query("DELETE FROM sessions WHERE token_hash=$1", [sha256(token)]);
+    await orm()
+      .delete(sessions)
+      .where(eq(sessions.token_hash, sha256(token)));
 }
 export function sessionHeader(
   request: Request,

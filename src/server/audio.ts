@@ -1,5 +1,7 @@
 import { put, get, del } from "@vercel/blob";
-import { query, transaction } from "./db";
+import { and, asc, eq, sql } from "drizzle-orm";
+import { orm, ormTransaction } from "./db";
+import { audioAssets, blobDeletions, notes } from "./schema";
 import { AppError } from "./errors";
 const maxBytes = 4 * 1024 * 1024;
 export interface AudioStorage {
@@ -108,12 +110,12 @@ export async function storeAudio(
     type = "audio/wav";
     extension = "wav";
   } else throw new AppError(400, "INVALID_AUDIO", "不支持此录音格式。");
-  const owner = await query(
-    "SELECT status FROM notes WHERE id=$1 AND user_id=$2",
-    [noteId, userId],
-  );
-  if (!owner.rows[0]) throw new AppError(404, "NOTE_NOT_FOUND", "便签不存在。");
-  if (owner.rows[0].status !== "draft")
+  const [owner] = await orm()
+    .select({ status: notes.status })
+    .from(notes)
+    .where(and(eq(notes.id, noteId), eq(notes.user_id, userId)));
+  if (!owner) throw new AppError(404, "NOTE_NOT_FOUND", "便签不存在。");
+  if (owner.status !== "draft")
     throw new AppError(
       409,
       "NOTE_ALREADY_SUBMITTED",
@@ -125,36 +127,42 @@ export async function storeAudio(
     type,
   );
   try {
-    await transaction(async (c) => {
-      const n = await c.query(
-        "SELECT status FROM notes WHERE id=$1 AND user_id=$2 FOR UPDATE",
-        [noteId, userId],
-      );
-      if (!n.rows[0] || n.rows[0].status !== "draft")
+    await ormTransaction(async (db) => {
+      const [note] = await db
+        .select({ status: notes.status })
+        .from(notes)
+        .where(and(eq(notes.id, noteId), eq(notes.user_id, userId)))
+        .for("update");
+      if (!note || note.status !== "draft")
         throw new AppError(
           409,
           "NOTE_ALREADY_SUBMITTED",
           "便签已提交，音频未替换。",
         );
-      const old = await c.query(
-        "SELECT pathname FROM audio_assets WHERE note_id=$1",
-        [noteId],
-      );
-      await c.query(
-        "INSERT INTO audio_assets(note_id,user_id,pathname,mime_type,size_bytes) VALUES($1,$2,$3,$4,$5) ON CONFLICT(note_id) DO UPDATE SET pathname=excluded.pathname,mime_type=excluded.mime_type,size_bytes=excluded.size_bytes",
-        [noteId, userId, blob.pathname, type, file.size],
-      );
-      if (old.rows[0])
-        await c.query(
-          "INSERT INTO blob_deletions(pathname) VALUES($1) ON CONFLICT DO NOTHING",
-          [old.rows[0].pathname],
-        );
+      const [old] = await db
+        .select({ pathname: audioAssets.pathname })
+        .from(audioAssets)
+        .where(eq(audioAssets.note_id, noteId));
+      const asset = {
+        pathname: blob.pathname,
+        mime_type: type,
+        size_bytes: file.size,
+      };
+      await db
+        .insert(audioAssets)
+        .values({ note_id: noteId, user_id: userId, ...asset })
+        .onConflictDoUpdate({ target: audioAssets.note_id, set: asset });
+      if (old)
+        await db
+          .insert(blobDeletions)
+          .values({ pathname: old.pathname })
+          .onConflictDoNothing();
     });
   } catch (error) {
-    await query(
-      "INSERT INTO blob_deletions(pathname) VALUES($1) ON CONFLICT DO NOTHING",
-      [blob.pathname],
-    );
+    await orm()
+      .insert(blobDeletions)
+      .values({ pathname: blob.pathname })
+      .onConflictDoNothing();
     throw error;
   }
   return { saved: true, size: file.size, mime_type: type };
@@ -166,12 +174,19 @@ export async function readAudio(
   storage: AudioStorage = privateStorage,
 ) {
   requireStorage();
-  const r = await query(
-    "SELECT a.pathname FROM audio_assets a JOIN notes n ON n.id=a.note_id WHERE n.id=$1 AND n.user_id=$2 AND a.user_id=$2",
-    [noteId, userId],
-  );
-  if (!r.rows[0]) throw new AppError(404, "AUDIO_NOT_FOUND", "音频不存在。");
-  const stored = await storage.read(r.rows[0].pathname);
+  const [asset] = await orm()
+    .select({ pathname: audioAssets.pathname })
+    .from(audioAssets)
+    .innerJoin(notes, eq(notes.id, audioAssets.note_id))
+    .where(
+      and(
+        eq(notes.id, noteId),
+        eq(notes.user_id, userId),
+        eq(audioAssets.user_id, userId),
+      ),
+    );
+  if (!asset) throw new AppError(404, "AUDIO_NOT_FOUND", "音频不存在。");
+  const stored = await storage.read(asset.pathname);
   if (!stored) throw new AppError(404, "AUDIO_NOT_FOUND", "音频不存在。");
   const headers = new Headers({
     "Content-Type": stored.contentType,
@@ -214,21 +229,25 @@ export async function cleanupAudio(
   storage: AudioStorage = privateStorage,
 ) {
   if (!audioConfigured()) return;
-  const rows = await query(
-    "SELECT pathname FROM blob_deletions ORDER BY created_at LIMIT $1",
-    [limit],
-  );
-  for (const row of rows.rows) {
+  const rows = await orm()
+    .select({ pathname: blobDeletions.pathname })
+    .from(blobDeletions)
+    .orderBy(asc(blobDeletions.created_at))
+    .limit(limit);
+  for (const row of rows) {
     try {
       await storage.remove(row.pathname);
-      await query("DELETE FROM blob_deletions WHERE pathname=$1", [
-        row.pathname,
-      ]);
+      await orm()
+        .delete(blobDeletions)
+        .where(eq(blobDeletions.pathname, row.pathname));
     } catch {
-      await query(
-        "UPDATE blob_deletions SET attempts=attempts+1,last_error='storage_delete_failed' WHERE pathname=$1",
-        [row.pathname],
-      );
+      await orm()
+        .update(blobDeletions)
+        .set({
+          attempts: sql`${blobDeletions.attempts} + 1`,
+          last_error: "storage_delete_failed",
+        })
+        .where(eq(blobDeletions.pathname, row.pathname));
     }
   }
 }

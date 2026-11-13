@@ -727,16 +727,19 @@ p {
   color: #8d9b72;
 }
 .draft-card {
-  display: block;
-  width: 100%;
-  text-align: left;
   background: #f2e6cf;
   border: 1px dashed #b89b74;
   border-radius: 7px;
   padding: 12px;
   margin-bottom: 20px;
 }
-.draft-card > span {
+.draft-open {
+  display: block;
+  width: 100%;
+  padding: 0;
+  text-align: left;
+}
+.draft-open > span {
   font-size: 9px;
   color: #b08b5d;
 }
@@ -751,6 +754,16 @@ p {
 .draft-card small {
   font-size: 9px;
   color: #b18d60;
+}
+.draft-delete {
+  padding: 6px 0;
+  color: #a46c4c;
+  font-size: 11px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.draft-delete:disabled {
+  opacity: 0.5;
 }
 .todo-card {
   padding: 17px;
@@ -969,7 +982,7 @@ p {
   display: grid;
   place-items: center;
   margin: 5px auto 13px;
-  width: 85px;
+  width: 120px;
   height: 80px;
   padding: 0;
   background: transparent;
@@ -1258,6 +1271,9 @@ p {
   border-radius: 5px;
   padding: 9px 11px;
   margin: 14px 0;
+}
+.chat-composer .composer-notice {
+  margin: 0 0 8px;
 }
 .profile-auth {
   margin-left: auto;

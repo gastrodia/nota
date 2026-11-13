@@ -36,8 +36,10 @@ export function createMockModel() {
       message = {
         role: "assistant",
         content: JSON.stringify({
-          authorized: !input.user_input.includes("不要"),
+          decision: input.user_input.includes("不要") ? "deny" : "allow",
+          resolves_pending: false,
           reason: "Protocol fixture",
+          question: null,
         }),
       };
     } else if (body.response_format) {

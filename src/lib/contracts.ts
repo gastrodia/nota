@@ -40,6 +40,7 @@ export const agentResultSchema = z
   })
   .strict();
 export type AgentResult = z.infer<typeof agentResultSchema> & {
+  needs_clarification?: boolean;
   todos: Todo[];
   sources: Evidence[];
 };
@@ -55,6 +56,7 @@ export interface Note {
   status: "draft" | "processing" | "ready" | "failed";
   source: string;
   created_at: string;
+  recorded_at?: string;
   duration_seconds: number | null;
   has_audio: boolean;
 }
@@ -72,6 +74,8 @@ export interface Evidence {
   title: string;
   transcript: string;
   created_at: string;
+  recorded_at?: string;
+  excerpt_truncated?: boolean;
 }
 export interface JobEvent {
   id: string;

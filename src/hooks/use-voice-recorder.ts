@@ -1,9 +1,17 @@
 "use client";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { RealtimeTranscriber } from "../lib/asr-client";
+import {
+  loadAudioDraft,
+  saveAudioDraft,
+  removeAudioDraft,
+  type AudioDraft,
+} from "../lib/audio-draft";
+import { transcribeRecordedAudio } from "../lib/recorded-asr";
 type RecordingStatus =
   "idle" | "requesting" | "recording" | "finishing" | "recorded" | "error";
 interface Options {
+  ownerId?: string;
   asr?: { realtime: boolean; onText?: (text: string) => void };
 }
 function describeError(error: unknown) {
@@ -17,6 +25,16 @@ function describeError(error: unknown) {
   return "暂时无法开始录音，请重试或改用文字记录。";
 }
 export function useVoiceRecorder(options: Options = {}) {
+  const [audioId, setAudioId] = useState("");
+  const [recordedAt, setRecordedAt] = useState("");
+  const [durabilityError, setDurabilityError] = useState("");
+  const [recovered, setRecovered] = useState(false);
+  const [recovering, setRecovering] = useState(true);
+  const draftRef = useRef<AudioDraft | null>(null);
+  const persistenceRef = useRef<Promise<void>>(Promise.resolve());
+  const retryRef = useRef<AbortController | null>(null);
+  const editRevisionRef = useRef(0);
+  const ownerId = options.ownerId ?? "anonymous";
   const [status, setStatus] = useState<RecordingStatus>("idle");
   const [duration, setDuration] = useState(0);
   const [audioUrl, setAudioUrl] = useState("");
@@ -51,8 +69,20 @@ export function useVoiceRecorder(options: Options = {}) {
     streamRef.current?.getTracks().forEach((track) => track.stop());
     streamRef.current = null;
   }, []);
+  const persist = useCallback((draft: AudioDraft) => {
+    const task = persistenceRef.current
+      .catch(() => {})
+      .then(() => saveAudioDraft(draft));
+    persistenceRef.current = task;
+    void task.catch(() => {
+      if (mountedRef.current && draftRef.current?.id === draft.id)
+        setDurabilityError("本机录音保存失败，请下载原音后再离开页面。");
+    });
+    return task;
+  }, []);
   const start = useCallback(async () => {
     if (requestRef.current || recorderRef.current) return;
+    retryRef.current?.abort();
     if (
       !navigator.mediaDevices?.getUserMedia ||
       typeof MediaRecorder === "undefined"
@@ -62,22 +92,23 @@ export function useVoiceRecorder(options: Options = {}) {
       return;
     }
     const generation = ++generationRef.current;
+    const captureId = crypto.randomUUID();
+    const captureTime = new Date().toISOString();
     requestRef.current = true;
     setStatus("requesting");
     setError("");
-    setDuration(0);
-    setTranscript("");
     setAsrError("");
     setAsrStatus("idle");
     let stream: MediaStream | null = null;
     let transcriber: RealtimeTranscriber | null = null;
+    let connecting: Promise<void> | null = null;
     const config = optionsRef.current.asr;
     if (config) {
       try {
         transcriber = new RealtimeTranscriber(config.realtime, (text) => {
           if (mountedRef.current && generation === generationRef.current) {
             setTranscript(text);
-            config.onText?.(text);
+            if (editRevisionRef.current === 0) config.onText?.(text);
           }
         });
         transcriberRef.current = transcriber;
@@ -94,21 +125,6 @@ export function useVoiceRecorder(options: Options = {}) {
         return;
       }
       streamRef.current = stream;
-      if (transcriber) {
-        setAsrStatus("connecting");
-        try {
-          await transcriber.connect(stream);
-          setAsrStatus("listening");
-        } catch {
-          transcriber.cancel();
-          transcriber = null;
-          transcriberRef.current = null;
-          if (generation === generationRef.current) {
-            setAsrStatus("error");
-            setAsrError("语音识别连接失败，原始录音仍可保存或手动输入。");
-          }
-        }
-      }
       if (!mountedRef.current || generation !== generationRef.current) {
         stream.getTracks().forEach((track) => track.stop());
         return;
@@ -127,6 +143,19 @@ export function useVoiceRecorder(options: Options = {}) {
       const started = Date.now();
       recorder.ondataavailable = (event) => {
         if (event.data.size > 0) chunks.push(event.data);
+        const current = draftRef.current;
+        if (current?.id === captureId && chunks.length) {
+          const captured = {
+            ...current,
+            blob: new Blob(chunks, { type: recorder.mimeType }),
+            duration_seconds: Math.min(
+              60,
+              Math.floor((Date.now() - started) / 1000),
+            ),
+          };
+          draftRef.current = captured;
+          void persist(captured).catch(() => {});
+        }
       };
       recorder.onstop = async () => {
         stream?.getTracks().forEach((track) => track.stop());
@@ -147,6 +176,13 @@ export function useVoiceRecorder(options: Options = {}) {
         urlRef.current = url;
         setAudioBlob(blob);
         setAudioUrl(url);
+        const captured = draftRef.current;
+        if (captured?.id === captureId) {
+          draftRef.current = { ...captured, blob };
+          // Commit original audio before waiting for the remote transcript.
+          await persist(draftRef.current).catch(() => {});
+        }
+        await connecting;
         if (transcriber) {
           setAsrStatus("finalizing");
           try {
@@ -154,6 +190,15 @@ export function useVoiceRecorder(options: Options = {}) {
             if (generation !== generationRef.current || !mountedRef.current)
               return;
             setTranscript(text);
+            const current = draftRef.current;
+            if (current?.id === captureId) {
+              draftRef.current = {
+                ...current,
+                transcript:
+                  editRevisionRef.current === 0 ? text : current.transcript,
+              };
+              await persist(draftRef.current).catch(() => {});
+            }
             setAsrStatus("complete");
             if (!text.trim())
               setAsrError("没有识别到语音，可以重新录制或手动输入。");
@@ -186,14 +231,54 @@ export function useVoiceRecorder(options: Options = {}) {
         setError("录音意外中断，请重新录制。麦克风已释放。");
       };
       recorder.start(250);
+      editRevisionRef.current = 0;
+      setAudioId(captureId);
+      setRecordedAt(captureTime);
+      setRecovered(false);
+      setDurabilityError("");
+      draftRef.current = {
+        owner_id: optionsRef.current.ownerId ?? "anonymous",
+        id: captureId,
+        blob: new Blob(),
+        duration_seconds: 0,
+        recorded_at: captureTime,
+        transcript: "",
+      };
+      if (urlRef.current) URL.revokeObjectURL(urlRef.current);
+      urlRef.current = "";
+      setAudioUrl("");
+      setAudioBlob(null);
+      setDuration(0);
+      setTranscript("");
       requestRef.current = false;
       setStatus("recording");
+      if (transcriber) {
+        const activeTranscriber = transcriber;
+        setAsrStatus("connecting");
+        // The local recorder is already running; a network outage cannot delay capture.
+        connecting = activeTranscriber
+          .connect(stream)
+          .then(() => {
+            if (generation === generationRef.current && mountedRef.current)
+              setAsrStatus("listening");
+          })
+          .catch(() => {
+            activeTranscriber.cancel();
+            transcriber = null;
+            transcriberRef.current = null;
+            if (generation === generationRef.current && mountedRef.current) {
+              setAsrStatus("error");
+              setAsrError("语音识别连接失败，原音已保留，可稍后重新转写。");
+            }
+          });
+      }
       timerRef.current = setInterval(
         () =>
           setDuration(Math.min(60, Math.floor((Date.now() - started) / 1000))),
         500,
       );
       limitRef.current = setTimeout(() => stopRef.current(), 60000);
+      return true;
     } catch (caught) {
       stream?.getTracks().forEach((track) => track.stop());
       transcriber?.cancel();
@@ -202,10 +287,10 @@ export function useVoiceRecorder(options: Options = {}) {
       streamRef.current = null;
       transcriberRef.current = null;
       requestRef.current = false;
-      setStatus("error");
+      setStatus(draftRef.current?.blob.size ? "recorded" : "error");
       setError(describeError(caught));
     }
-  }, [clearTimer, releaseStream]);
+  }, [clearTimer, releaseStream, persist]);
   const stop = useCallback(() => {
     if (requestRef.current) {
       ++generationRef.current;
@@ -235,27 +320,185 @@ export function useVoiceRecorder(options: Options = {}) {
   useEffect(() => {
     stopRef.current = stop;
   }, [stop]);
-  const discard = useCallback(() => {
-    ++generationRef.current;
-    requestRef.current = false;
-    clearTimer();
-    transcriberRef.current?.cancel();
-    transcriberRef.current = null;
-    const recorder = recorderRef.current;
-    if (recorder && recorder.state !== "inactive") recorder.stop();
-    recorderRef.current = null;
-    releaseStream();
-    if (urlRef.current) URL.revokeObjectURL(urlRef.current);
-    urlRef.current = "";
-    setAudioUrl("");
-    setAudioBlob(null);
-    setError("");
+  const discard = useCallback(
+    (removeSaved = true) => {
+      const current = draftRef.current;
+      draftRef.current = null;
+      editRevisionRef.current = 0;
+      retryRef.current?.abort();
+      if (removeSaved && current) {
+        persistenceRef.current = persistenceRef.current
+          .catch(() => {})
+          .then(() => removeAudioDraft(current.owner_id, current.id));
+        void persistenceRef.current.catch(() =>
+          setDurabilityError("本机录音未能删除，请稍后重试。"),
+        );
+      }
+      ++generationRef.current;
+      requestRef.current = false;
+      clearTimer();
+      transcriberRef.current?.cancel();
+      transcriberRef.current = null;
+      const recorder = recorderRef.current;
+      if (recorder && recorder.state !== "inactive") recorder.stop();
+      recorderRef.current = null;
+      releaseStream();
+      if (urlRef.current) URL.revokeObjectURL(urlRef.current);
+      urlRef.current = "";
+      setAudioUrl("");
+      setAudioBlob(null);
+      setAudioId("");
+      setRecordedAt("");
+      setRecovered(false);
+      setError("");
+      setAsrError("");
+      setAsrStatus("idle");
+      setTranscript("");
+      setDuration(0);
+      setStatus("idle");
+    },
+    [clearTimer, releaseStream],
+  );
+  useEffect(() => {
+    let cancelled = false;
+    // Resetting capture resources synchronizes the active account with external IndexedDB storage.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    discard(false);
+    setRecovering(true);
+    void persistenceRef.current
+      .catch(() => {})
+      .then(() => loadAudioDraft(ownerId))
+      .then((saved) => {
+        if (
+          cancelled ||
+          !saved ||
+          requestRef.current ||
+          recorderRef.current ||
+          draftRef.current
+        )
+          return;
+        draftRef.current = saved;
+        editRevisionRef.current = saved.transcript ? 1 : 0;
+        const url = URL.createObjectURL(saved.blob);
+        urlRef.current = url;
+        setAudioUrl(url);
+        setAudioBlob(saved.blob);
+        setAudioId(saved.id);
+        setRecordedAt(saved.recorded_at);
+        setDuration(saved.duration_seconds);
+        setTranscript(saved.transcript);
+        setStatus("recorded");
+        setRecovered(true);
+        optionsRef.current.asr?.onText?.(saved.transcript);
+      })
+      .catch(() => {
+        if (!cancelled)
+          setDurabilityError("浏览器无法恢复本机录音；新录音请先下载保留。");
+      })
+      .finally(() => {
+        if (!cancelled) setRecovering(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [ownerId, discard]);
+  const restoreAudio = useCallback(
+    async (
+      blob: Blob,
+      metadata: {
+        id: string;
+        recorded_at: string;
+        duration_seconds: number;
+        transcript: string;
+      },
+    ) => {
+      discard(false);
+      const saved = {
+        ...metadata,
+        blob,
+        owner_id: optionsRef.current.ownerId ?? "anonymous",
+      };
+      const generation = generationRef.current;
+      await persist(saved);
+      if (
+        generation !== generationRef.current ||
+        saved.owner_id !== (optionsRef.current.ownerId ?? "anonymous")
+      )
+        return;
+      draftRef.current = saved;
+      editRevisionRef.current = saved.transcript ? 1 : 0;
+      const url = URL.createObjectURL(blob);
+      urlRef.current = url;
+      setAudioUrl(url);
+      setAudioBlob(blob);
+      setAudioId(saved.id);
+      setRecordedAt(saved.recorded_at);
+      setDuration(saved.duration_seconds);
+      setTranscript(saved.transcript);
+      setStatus("recorded");
+      setRecovered(true);
+    },
+    [discard, persist],
+  );
+  const saveTranscript = useCallback(
+    (text: string) => {
+      editRevisionRef.current++;
+      const current = draftRef.current;
+      if (current) {
+        draftRef.current = { ...current, transcript: text };
+        if (current.blob.size) void persist(draftRef.current).catch(() => {});
+      }
+    },
+    [persist],
+  );
+  const markUploaded = useCallback(async () => {
+    const current = draftRef.current;
+    if (!current) return;
+    await persistenceRef.current.catch(() => {});
+    await removeAudioDraft(current.owner_id, current.id);
+  }, []);
+  const retryTranscription = useCallback(async () => {
+    const current = draftRef.current;
+    if (!current?.blob.size || recorderRef.current || requestRef.current)
+      return;
+    const controller = new AbortController();
+    retryRef.current?.abort();
+    retryRef.current = controller;
+    const generation = generationRef.current;
+    editRevisionRef.current = 0;
+    setAsrStatus("finalizing");
     setAsrError("");
-    setAsrStatus("idle");
-    setTranscript("");
-    setDuration(0);
-    setStatus("idle");
-  }, [clearTimer, releaseStream]);
+    setStatus("finishing");
+    try {
+      const text = await transcribeRecordedAudio(
+        current.blob,
+        controller.signal,
+      );
+      if (controller.signal.aborted || generation !== generationRef.current)
+        return;
+      const latest = draftRef.current ?? current;
+      draftRef.current = {
+        ...latest,
+        transcript: editRevisionRef.current === 0 ? text : latest.transcript,
+      };
+      await persist(draftRef.current).catch(() => {});
+      setTranscript(text);
+      if (editRevisionRef.current === 0) optionsRef.current.asr?.onText?.(text);
+      setAsrStatus("complete");
+    } catch (caught) {
+      if (controller.signal.aborted || generation !== generationRef.current)
+        return;
+      setAsrStatus("error");
+      setAsrError(
+        caught instanceof Error
+          ? caught.message
+          : "转写失败，原音仍保存在本机。",
+      );
+    } finally {
+      if (!controller.signal.aborted && generation === generationRef.current)
+        setStatus("recorded");
+    }
+  }, [persist]);
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -266,6 +509,7 @@ export function useVoiceRecorder(options: Options = {}) {
       requestRef.current = false;
       clearTimer();
       transcriberRef.current?.cancel();
+      retryRef.current?.abort();
       const recorder = recorderRef.current;
       if (recorder && recorder.state !== "inactive") recorder.stop();
       recorderRef.current = null;
@@ -274,6 +518,15 @@ export function useVoiceRecorder(options: Options = {}) {
     };
   }, [clearTimer, releaseStream]);
   return {
+    audioId,
+    recordedAt,
+    recovered,
+    recovering,
+    durabilityError,
+    saveTranscript,
+    markUploaded,
+    retryTranscription,
+    restoreAudio,
     status,
     duration,
     audioUrl,

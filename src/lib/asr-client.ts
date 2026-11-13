@@ -25,6 +25,7 @@ export class RealtimeTranscriber {
   private node?: AudioWorkletNode;
   private pcm: ArrayBuffer[] = [];
   private bytes = 0;
+  private socketReady = false;
   private cancelled = false;
   private ending = false;
   private text = "";
@@ -44,7 +45,6 @@ export class RealtimeTranscriber {
   async connect(stream: MediaStream) {
     await timed(this.resumed, 7000, "音频环境启动超时，请再次点击录音。");
     if (this.cancelled) throw new Error("cancelled");
-    if (this.realtime) await this.connectSocket();
     await this.context.audioWorklet.addModule("/audio/pcm-worklet.js");
     if (this.cancelled) throw new Error("cancelled");
     this.source = this.context.createMediaStreamSource(stream);
@@ -60,7 +60,9 @@ export class RealtimeTranscriber {
       if (remaining <= 0) return;
       const buffer = raw.byteLength > remaining ? raw.slice(0, remaining) : raw;
       this.bytes += buffer.byteLength;
-      if (this.realtime) {
+      if (this.realtime && !this.socketReady) {
+        this.pcm.push(buffer);
+      } else if (this.realtime) {
         if (
           this.socket?.readyState !== WebSocket.OPEN ||
           this.socket.bufferedAmount > 1024 * 1024
@@ -81,6 +83,20 @@ export class RealtimeTranscriber {
     this.source.connect(this.node);
     this.node.connect(muted);
     muted.connect(this.context.destination);
+    if (this.realtime) {
+      await this.connectSocket();
+      if (this.cancelled) throw new Error("cancelled");
+      this.socketReady = true;
+      for (const buffer of this.pcm) {
+        const bytes = new Uint8Array(buffer);
+        let binary = "";
+        for (const byte of bytes) binary += String.fromCharCode(byte);
+        this.socket!.send(
+          JSON.stringify({ type: "audio", audio: btoa(binary) }),
+        );
+      }
+      this.pcm = [];
+    }
   }
   private connectSocket() {
     return new Promise<void>((resolve, reject) => {
