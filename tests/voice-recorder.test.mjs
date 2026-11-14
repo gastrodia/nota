@@ -8,6 +8,7 @@ import { JSDOM } from "jsdom";
 import React, { act } from "react";
 import { IDBFactory } from "fake-indexeddb";
 import { createRoot } from "react-dom/client";
+import { renderToStaticMarkup } from "react-dom/server";
 
 const project = fileURLToPath(new URL("../", import.meta.url));
 const buildDir = await mkdtemp(join(project, "work/recorder-test-"));
@@ -68,6 +69,21 @@ const appSource = await readFile(
   join(project, "src/components/nota-workspace.tsx"),
   "utf8",
 );
+for (const name of ["markdown-message", "ui-icon"]) {
+  await writeFile(
+    join(buildDir, `${name}.mjs`),
+    ts.transpileModule(
+      await readFile(join(project, `src/components/${name}.tsx`), "utf8"),
+      {
+        compilerOptions: {
+          target: ts.ScriptTarget.ES2022,
+          module: ts.ModuleKind.ESNext,
+          jsx: ts.JsxEmit.ReactJSX,
+        },
+      },
+    ).outputText,
+  );
+}
 const appCompiled = ts
   .transpileModule(appSource, {
     compilerOptions: {
@@ -80,13 +96,81 @@ const appCompiled = ts
   .replaceAll('"next/link"', '"./next-link.mjs"')
   .replaceAll('"@/hooks/use-voice-recorder"', '"./use-voice-recorder.mjs"')
   .replaceAll('"@/lib/demo-data"', '"./demo-data.mjs"')
-  .replaceAll('"@/lib/api"', '"./api.mjs"');
+  .replaceAll('"@/lib/api"', '"./api.mjs"')
+  .replaceAll('"@/components/markdown-message"', '"./markdown-message.mjs"')
+  .replaceAll('"@/components/ui-icon"', '"./ui-icon.mjs"');
 await writeFile(join(buildDir, "nota-workspace.mjs"), appCompiled);
 const { NotaWorkspace } = await import(
   pathToFileURL(join(buildDir, "nota-workspace.mjs")).href
 );
+const { MarkdownMessage } = await import(
+  pathToFileURL(join(buildDir, "markdown-message.mjs")).href
+);
 test.after(async () => {
   await rm(buildDir, { recursive: true });
+});
+
+test("assistant Markdown renders Chinese task replies and GFM as semantic content", () => {
+  const dom = new JSDOM(
+    renderToStaticMarkup(
+      React.createElement(
+        MarkdownMessage,
+        null,
+        [
+          "你目前有 2 条未完成的待办：",
+          "",
+          "1. **赶飞机（明天上午9:00航班）** — 截止时间：2026-11-14 09:00",
+          "2. **参加APEC** — 截止时间：2026-11-14 18:00",
+          "",
+          "| 事项 | 状态 |",
+          "| --- | --- |",
+          "| 报价 | ~~草稿~~ |",
+          "",
+          "- [x] 已确认",
+          "",
+          "```js",
+          "const amount = 80000;",
+          "```",
+          "",
+          "[参考](https://example.com/notes)",
+        ].join("\n"),
+      ),
+    ),
+  );
+  const document = dom.window.document;
+  assert.equal(document.querySelectorAll("ol > li").length, 2);
+  assert.equal(
+    document.querySelector("strong").textContent,
+    "赶飞机（明天上午9:00航班）",
+  );
+  assert.equal(document.querySelectorAll("table th").length, 2);
+  assert.equal(document.querySelector("del").textContent, "草稿");
+  assert.equal(document.querySelector('input[type="checkbox"]').disabled, true);
+  assert.match(
+    document.querySelector("pre code").textContent,
+    /amount = 80000/,
+  );
+  const link = document.querySelector("a");
+  assert.equal(link.href, "https://example.com/notes");
+  assert.equal(link.rel, "noopener noreferrer");
+  dom.window.close();
+});
+
+test("assistant Markdown rejects executable HTML, unsafe URLs and remote images", () => {
+  const dom = new JSDOM(
+    renderToStaticMarkup(
+      React.createElement(
+        MarkdownMessage,
+        null,
+        '<script>alert(1)</script>\n\n<img src=x onerror="alert(1)">\n\n[危险链接](javascript:alert%281%29)\n\n![追踪](https://example.com/track.png)\n\n**正常内容**',
+      ),
+    ),
+  );
+  const document = dom.window.document;
+  assert.equal(document.querySelector("script, img, [onerror]"), null);
+  assert.equal(document.querySelector('a[href^="javascript:"]'), null);
+  assert.equal(document.querySelector("strong").textContent, "正常内容");
+  dom.window.close();
 });
 
 async function harness(t, getMedia, App, hookOptions = {}) {

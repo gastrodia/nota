@@ -1,6 +1,8 @@
 "use client";
 import Image from "next/image";
 import Link from "next/link";
+import { MarkdownMessage } from "@/components/markdown-message";
+import { UiIcon } from "@/components/ui-icon";
 import {
   useCallback,
   useEffect,
@@ -660,10 +662,14 @@ export function NotaWorkspace() {
           <div className="assistant-bubble">
             {job.status === "succeeded" && job.result ? (
               <>
-                <p>{job.result.answer || job.result.summary}</p>
+                <MarkdownMessage>
+                  {job.result.answer || job.result.summary}
+                </MarkdownMessage>
                 {job.result.todos.map((todo) => (
                   <div className="message-task" key={todo.id}>
-                    <span>✓</span>
+                    <span>
+                      <UiIcon name="check" />
+                    </span>
                     <div>
                       <strong>{todo.title}</strong>
                       <small>{date(todo.due_at)}</small>
@@ -672,7 +678,9 @@ export function NotaWorkspace() {
                 ))}
                 {job.result.queried_todos?.map((todo) => (
                   <div className="message-task" key={`queried-${todo.id}`}>
-                    <span>{todo.completed ? "✓" : "○"}</span>
+                    <span>
+                      <UiIcon name={todo.completed ? "check" : "circle"} />
+                    </span>
                     <div>
                       <strong>{todo.title}</strong>
                       <small>
@@ -774,7 +782,7 @@ export function NotaWorkspace() {
                 onClick={newChat}
                 aria-label="新建对话"
               >
-                ＋
+                <UiIcon name="plus" />
               </button>
             </div>
             {user && jobs.length > 0 ? (
@@ -821,7 +829,9 @@ export function NotaWorkspace() {
                         : setExample("todo")
                     }
                   >
-                    <span className="suggestion-mark peach">✓</span>
+                    <span className="suggestion-mark peach">
+                      <UiIcon name="check" />
+                    </span>
                     <span>
                       <strong>帮我创建发送报价单的待办</strong>
                       <small>
@@ -911,7 +921,7 @@ export function NotaWorkspace() {
                 disabled={!question.trim() || busy}
                 aria-label="发送问题"
               >
-                ↑
+                <UiIcon name="arrow-up" />
               </button>
             </div>
             <p className="composer-hint">
@@ -993,7 +1003,9 @@ export function NotaWorkspace() {
               aria-labelledby="history-tab"
             >
               <label className="history-search">
-                <span aria-hidden="true">⌕</span>
+                <span aria-hidden="true">
+                  <UiIcon name="search" />
+                </span>
                 <span className="sr-only">搜索历史</span>
                 <input
                   type="search"
@@ -1193,14 +1205,14 @@ export function NotaWorkspace() {
           <span>Agent</span>
         </button>
         <button
-          className="voice-nav"
+          className="nav-item voice-nav"
           aria-label="打开语音录音浮窗"
           onClick={openVoice}
         >
           <Image
             src="/art/microphone.png"
-            width={126}
-            height={84}
+            width={72}
+            height={48}
             alt=""
             className="pixel-art"
           />
@@ -1243,7 +1255,7 @@ export function NotaWorkspace() {
               onClick={closeVoice}
               aria-label="关闭语音浮窗"
             >
-              ×
+              <UiIcon name="close" />
             </button>
           </div>
           <div className="voice-tabs" role="group" aria-label="记录方式">
@@ -1537,7 +1549,7 @@ export function NotaWorkspace() {
               onClick={() => sourceDialog.current?.close()}
               aria-label="关闭便签详情"
             >
-              ×
+              <UiIcon name="close" />
             </button>
           </div>
           <h2 id="note-title">{note.title}</h2>
@@ -1556,7 +1568,7 @@ export function NotaWorkspace() {
           )}
           <section>
             <h3>摘要</h3>
-            <p>{note.summary || "尚未整理。"}</p>
+            <MarkdownMessage>{note.summary || "尚未整理。"}</MarkdownMessage>
           </section>
           <section>
             <h3>转写原文</h3>
@@ -1565,7 +1577,9 @@ export function NotaWorkspace() {
           {noteIsReal
             ? (note as NoteDetail).todos?.map((todo) => (
                 <div className="message-task" key={todo.id}>
-                  <span>✓</span>
+                  <span>
+                    <UiIcon name="check" />
+                  </span>
                   <div>
                     <strong>{todo.title}</strong>
                     <small>{date(todo.due_at)}</small>
@@ -1574,7 +1588,9 @@ export function NotaWorkspace() {
               ))
             : (note as DemoNote).task && (
                 <div className="message-task">
-                  <span>✓</span>
+                  <span>
+                    <UiIcon name="check" />
+                  </span>
                   <div>
                     <strong>{(note as DemoNote).task}</strong>
                     <small>2026/11/13 15:00 · 示例</small>
@@ -1666,7 +1682,7 @@ export function NotaWorkspace() {
               onClick={() => authDialog.current?.close()}
               aria-label="关闭登录浮窗"
             >
-              ×
+              <UiIcon name="close" />
             </button>
           </div>
           <form className="auth-form" onSubmit={submitAuth}>

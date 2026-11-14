@@ -72,6 +72,13 @@ p {
   image-rendering: pixelated;
   object-fit: contain;
 }
+.ui-icon {
+  display: inline-block;
+  width: 1em;
+  height: 1em;
+  flex-shrink: 0;
+  vertical-align: -0.125em;
+}
 .phone-app {
   width: 100%;
   max-width: 480px;
@@ -162,6 +169,8 @@ p {
   margin-top: 5px;
 }
 .new-chat {
+  display: grid;
+  place-items: center;
   width: 33px;
   height: 33px;
   border: 1.5px solid #c8aa82;
@@ -312,6 +321,9 @@ p {
   outline-offset: 3px;
 }
 .composer-field button {
+  display: grid;
+  place-items: center;
+  padding: 0;
   width: 31px;
   height: 31px;
   border: 1px solid #a77f55;
@@ -342,10 +354,10 @@ p {
   flex-shrink: 0;
   position: relative;
   z-index: 3;
-  height: calc(78px + env(safe-area-inset-bottom, 0px));
+  height: calc(84px + env(safe-area-inset-bottom, 0px));
   padding: 8px 24px calc(8px + env(safe-area-inset-bottom, 0px));
   display: grid;
-  grid-template-columns: 1fr 110px 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   align-items: center;
   border-top: 1.5px solid #896a49;
   border-radius: 17px 17px 0 0;
@@ -357,13 +369,18 @@ p {
   align-items: center;
   justify-content: center;
   flex-direction: column;
-  gap: 4px;
-  min-height: 55px;
+  gap: 3px;
+  min-height: 65px;
+  padding: 0 6px;
   color: #a18b6c;
   font-size: 11px;
   line-height: 1.2;
 }
 .nav-item img {
+  width: 33px;
+  height: 33px;
+  margin: 7.5px 0;
+  flex-shrink: 0;
   opacity: 0.65;
 }
 .nav-item.active {
@@ -374,25 +391,13 @@ p {
   opacity: 1;
 }
 .voice-nav {
-  align-self: end;
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  flex-direction: column;
-  height: 95px;
-  width: 110px;
-  margin-top: -31px;
-  padding: 0 0 4px;
-  position: relative;
-  font-size: 12px;
-  font-weight: 600;
-  line-height: 1.2;
+  color: var(--ink);
 }
 .voice-nav img {
-  width: 126px;
-  height: 84px;
-  max-width: none;
-  margin-bottom: -6px;
+  width: 72px;
+  height: 48px;
+  margin: 0;
+  opacity: 1;
   transition: transform 0.15s;
 }
 .voice-nav:hover img {
@@ -451,6 +456,97 @@ p {
   font-size: 11px;
   color: #a58c6b;
   margin-top: 10px;
+}
+.markdown-message {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.markdown-message > :first-child {
+  margin-top: 0;
+}
+.markdown-message > :last-child {
+  margin-bottom: 0;
+}
+.markdown-message p,
+.markdown-message ul,
+.markdown-message ol,
+.markdown-message blockquote,
+.markdown-message pre,
+.markdown-message .markdown-table-scroll {
+  margin: 0.75em 0;
+}
+.markdown-message :is(h1, h2, h3, h4, h5, h6) {
+  font-size: 1.1em;
+  line-height: 1.6;
+  margin: 1em 0 0.5em;
+}
+.markdown-message :is(ul, ol) {
+  padding-left: 1.6em;
+}
+.markdown-message li + li {
+  margin-top: 0.35em;
+}
+.markdown-message li > p {
+  margin: 0.35em 0;
+}
+.markdown-message a {
+  color: #9f6638;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.markdown-message blockquote {
+  padding-left: 12px;
+  border-left: 3px solid #cfb38d;
+  color: #897052;
+}
+.markdown-message code {
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+  background: #f1e7d4;
+  font: 0.9em/1.7 monospace;
+}
+.markdown-message pre {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 10px;
+  border: 1px solid var(--soft-line);
+  border-radius: 5px;
+  background: #f5eddc;
+  white-space: pre;
+}
+.markdown-message pre code {
+  padding: 0;
+  background: none;
+}
+.markdown-message .markdown-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+}
+.markdown-message table {
+  border-collapse: collapse;
+  font-size: 0.9em;
+}
+.markdown-message :is(th, td) {
+  padding: 6px 9px;
+  border: 1px solid var(--soft-line);
+  text-align: left;
+}
+.markdown-message th {
+  background: #f5eddc;
+}
+.markdown-message .contains-task-list {
+  padding-left: 0;
+  list-style: none;
+}
+.markdown-message .task-list-item input {
+  margin-right: 0.5em;
+  accent-color: #81915e;
+}
+.markdown-message hr {
+  border: 0;
+  border-top: 1px solid var(--soft-line);
+  margin: 1em 0;
 }
 .source-link {
   display: block;
@@ -527,6 +623,7 @@ p {
   border-radius: 6px;
 }
 .message-task > span {
+  flex-shrink: 0;
   width: 21px;
   height: 21px;
   display: grid;
@@ -534,6 +631,10 @@ p {
   border: 1px solid #b5c29f;
   border-radius: 3px;
   color: #81915e;
+}
+.message-task > div {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 .message-task strong {
   font-size: 12px;
@@ -1213,7 +1314,7 @@ p {
   }
   .bottom-nav {
     padding-bottom: 9px;
-    height: 79px;
+    height: 84px;
   }
 }
 @media (max-width: 359px) {
